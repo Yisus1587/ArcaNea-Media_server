@@ -281,14 +281,9 @@ def logs_tail(lines: int = 200, _: bool = Depends(admin_required)):
 
 
 def _sqlite_path_from_url(url: str) -> Path | None:
+    """Ruta del archivo SQLite de `url` (mismo parser que el resto del backend)."""
     try:
-        if not isinstance(url, str):
-            return None
-        u = url.strip()
-        if not u.lower().startswith("sqlite:///"):
-            return None
-        raw = u[len("sqlite:///") :]
-        return Path(raw).resolve()
+        return core_config.sqlite_path_from_url(url)
     except Exception:
         return None
 

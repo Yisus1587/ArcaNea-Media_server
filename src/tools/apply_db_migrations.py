@@ -17,21 +17,23 @@ import re
 from pathlib import Path
 
 try:
-    from ..core.config import DATA_DIR  # type: ignore
-except Exception:
+    from ..core.config import DATA_DIR, sqlite_path_from_url  # type: ignore
+except Exception:  # pragma: no cover - ejecución fuera del paquete (imports planos)
     DATA_DIR = Path('data')
+    sqlite_path_from_url = None  # type: ignore[assignment]
 
 def _resolve_sqlite_db_path() -> Path | None:
     """Resolve the *actual* SQLite file path the app is using.
 
     Important: the runtime DB may be overridden via `ARCANEA_DB_URL`. Migrations must
     target that same file, otherwise SQLAlchemy models can drift from schema and crash.
+    The URL -> path conversion lives in `core.config.sqlite_path_from_url`, so this tool
+    and the application always agree (Linux/Windows path differences included).
     """
     try:
         db_url = os.environ.get("ARCANEA_DB_URL", "") or ""
     except Exception:
         db_url = ""
-
     if not db_url:
         try:
             from ..core.config import get as _get  # type: ignore
@@ -39,51 +41,9 @@ def _resolve_sqlite_db_path() -> Path | None:
             db_url = str(_get("db_url") or "")
         except Exception:
             db_url = ""
-
-    db_url = (db_url or "").strip()
-    if not db_url:
+    if sqlite_path_from_url is None:
         return None
-
-    # Only handle sqlite file urls here.
-    if not db_url.lower().startswith("sqlite"):
-        return None
-
-    # Skip in-memory DBs.
-    if ":memory:" in db_url:
-        return None
-
-    # Common forms:
-    # - sqlite:///relative/path.db
-    # - sqlite:///C:/abs/path.db
-    # - sqlite:////C:/abs/path.db  (rare on Windows)
-    # - sqlite:////abs/path.db     (POSIX absolute)
-    url = db_url.split("?", 1)[0]
-
-    path_part = ""
-    if url.lower().startswith("sqlite:////"):
-        path_part = url[len("sqlite:////") :]
-    elif url.lower().startswith("sqlite:///"):
-        path_part = url[len("sqlite:///") :]
-    elif url.lower().startswith("sqlite://"):
-        # sqlite://relative.db (treat as relative)
-        path_part = url[len("sqlite://") :]
-    else:
-        return None
-
-    path_part = (path_part or "").strip().strip('"').strip("'")
-    if not path_part:
-        return None
-
-    # SQLAlchemy allows forward slashes in Windows paths; keep them.
-    # Convert leading "/C:/" -> "C:/" if present.
-    if re.match(r"^/[A-Za-z]:[\\/]", path_part):
-        path_part = path_part[1:]
-
-    p = Path(path_part)
-    try:
-        return p if p.is_absolute() else p.resolve()
-    except Exception:
-        return p
+    return sqlite_path_from_url(db_url)
 
 
 DB_PATH = _resolve_sqlite_db_path() or (Path(DATA_DIR) / "arcanea.db")

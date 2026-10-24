@@ -391,6 +391,43 @@ def set_temp_override(key: str, value):
     _temp_overrides[k] = value
 
 
+def sqlite_path_from_url(db_url: str | None) -> Path | None:
+    """Ruta del archivo SQLite que corresponde a `db_url`.
+
+    Usa el parser de SQLAlchemy (`make_url`) en lugar de interpretar el formato a
+    mano: es la misma fuente de verdad que usa el engine, así que respeta igual
+    `sqlite:///relativa.db`, `sqlite:///C:/ruta.db` y `sqlite:////ruta/absoluta.db`
+    tanto en Linux como en Windows.
+
+    Devuelve None para URLs que no son SQLite o para bases de datos en memoria.
+    """
+    raw = (db_url or "").strip()
+    if not raw:
+        return None
+    try:
+        from sqlalchemy.engine import make_url
+
+        url = make_url(raw)
+    except Exception:
+        return None
+    if url.get_backend_name() != "sqlite":
+        return None
+    database = (url.database or "").strip()
+    if not database or database == ":memory:" or database.lower().startswith("file::memory:"):
+        return None
+    # `sqlite:////C:/ruta.db` deja "/C:/ruta.db": el drive ya la hace absoluta.
+    if re.match(r"^/[A-Za-z]:[\\/]", database):
+        database = database[1:]
+    # Una ruta con unidad Windows ("C:/..." o "C:\\...") es absoluta en cualquier SO.
+    if re.match(r"^[A-Za-z]:[\\/]", database):
+        return Path(database)
+    path = Path(database)
+    try:
+        return path if path.is_absolute() else path.resolve()
+    except Exception:
+        return path
+
+
 def _resolve_sqlite_db_path() -> Path | None:
     """Resolve sqlite file path from ARCANEA_DB_URL / config.db_url."""
     try:
@@ -402,26 +439,7 @@ def _resolve_sqlite_db_path() -> Path | None:
             db_url = str(config.get("db_url") or "")
         except Exception:
             db_url = ""
-    db_url = (db_url or "").strip().split("?", 1)[0]
-    if not db_url.lower().startswith("sqlite") or ":memory:" in db_url:
-        return None
-    path_part = ""
-    if db_url.lower().startswith("sqlite:////"):
-        path_part = db_url[len("sqlite:////") :]
-    elif db_url.lower().startswith("sqlite:///"):
-        path_part = db_url[len("sqlite:///") :]
-    elif db_url.lower().startswith("sqlite://"):
-        path_part = db_url[len("sqlite://") :]
-    path_part = (path_part or "").strip().strip('"').strip("'")
-    if not path_part:
-        return None
-    if re.match(r"^/[A-Za-z]:[\\/]", path_part):
-        path_part = path_part[1:]
-    p = Path(path_part)
-    try:
-        return p if p.is_absolute() else p.resolve()
-    except Exception:
-        return p
+    return sqlite_path_from_url(db_url)
 
 
 def _read_setting(key: str):

@@ -26,28 +26,9 @@ def _ensure_settings_table_exists() -> None:
             db_url = str(core_config.get("db_url") or "")
         except Exception:
             db_url = ""
-        db_url = (db_url or "").strip().split("?", 1)[0]
-
-        db_path: Path | None = None
-        if db_url.lower().startswith("sqlite") and ":memory:" not in db_url:
-            if db_url.lower().startswith("sqlite:////"):
-                db_path = Path(db_url[len("sqlite:////") :])
-            elif db_url.lower().startswith("sqlite:///"):
-                db_path = Path(db_url[len("sqlite:///") :])
-            elif db_url.lower().startswith("sqlite://"):
-                db_path = Path(db_url[len("sqlite://") :])
-
+        db_path = core_config.sqlite_path_from_url(db_url)
         if db_path is None:
             db_path = Path(core_config.DATA_DIR).resolve() / "arcanea.db"
-
-        # Handle "/C:/" style paths if present.
-        try:
-            s = str(db_path)
-            if len(s) >= 4 and s[0] == "/" and s[2] == ":" and (s[3] == "\\" or s[3] == "/"):
-                db_path = Path(s[1:])
-        except Exception:
-            pass
-
         try:
             db_path = db_path.resolve() if not db_path.is_absolute() else db_path
         except Exception:
