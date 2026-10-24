@@ -117,8 +117,6 @@ El listado completo vive en `src/core/config.py`.
   backup, datos) exigen el token de admin; sin PIN configurado solo se
   aceptan peticiones desde localhost.
 - Para acceso en LAN, inicia el backend con `0.0.0.0` y revisa el firewall.
-- No subas a git: `certs/` (incluida la llave privada), `dist/`, `data/`,
-  `.env` ni `src.zip`; todo está en `.gitignore`.
 
 ## Licencia
 
