@@ -35,6 +35,10 @@ class MediaItem(Base):
     provider_id = Column(String, nullable=True)
     # MAL id (MyAnimeList) when detected from folder or metadata
     mal_id = Column(String, nullable=True)
+    # Jikan anime type (TV, OVA, ONA, Special, Movie)
+    jikan_type = Column(String, nullable=True)
+    # Anchor MAL id for grouping (OVA/ONA/Special -> Season 0 under same series)
+    jikan_anchor_mal_id = Column(String, nullable=True)
     # Local poster path cached on disk (relative to project or absolute)
     poster_path = Column(String, nullable=True)
     # status: SCANNED | ENRICHED | ERROR
@@ -54,6 +58,8 @@ class MediaItem(Base):
     tmdb_id = Column(String, nullable=True)
     backdrop_path = Column(String, nullable=True)
     rating = Column(Float, nullable=True)
+    # Content rating / certification (e.g., G, PG, TV-Y, TV-G, TV-Y7)
+    content_rating = Column(String, nullable=True)
     genres = Column(Text, nullable=True)
     # Additional titles/aliases extracted from folder names to improve matching
     search_titles = Column(Text, nullable=True)
@@ -65,13 +71,15 @@ class Series(Base):
     __tablename__ = 'series'
     id = Column(Integer, primary_key=True)
     # Back-compat display title (prefer localized, else English).
-    title = Column(String, nullable=False)
-    title_en = Column(String, nullable=True)
-    title_localized = Column(String, nullable=True)
+    title = Column(String, nullable=False, index=True)
+    title_en = Column(String, nullable=True, index=True)
+    title_localized = Column(String, nullable=True, index=True)
     # legacy field kept for backward compatibility; not used as primary exposure source
     provider_id = Column(String, nullable=True)
-    mal_id = Column(String, nullable=True)
-    tmdb_id = Column(String, nullable=True)
+    mal_id = Column(String, nullable=True, index=True)
+    tmdb_id = Column(String, nullable=True, index=True)
+    # Jikan anime type (TV, OVA, ONA, Special, Movie) for primary series
+    jikan_type = Column(String, nullable=True)
     # When TMDB cannot be resolved from the Jikan English anchor, mark as no-match to avoid infinite retries.
     tmdb_no_match = Column(Boolean, nullable=True, default=None)
     tmdb_no_match_reason = Column(String, nullable=True)
@@ -86,6 +94,15 @@ class Season(Base):
     season_number = Column(Integer, nullable=True)
     title_en = Column(String, nullable=True)
     title_localized = Column(String, nullable=True)
+    synopsis_localized = Column(Text, nullable=True)
+    poster_path = Column(String, nullable=True)
+    backdrop_path = Column(String, nullable=True)
+    tmdb_season_number = Column(Integer, nullable=True)
+    tmdb_episode_start = Column(Integer, nullable=True)
+    tmdb_episode_end = Column(Integer, nullable=True)
+    air_date_start = Column(String, nullable=True)
+    air_date_end = Column(String, nullable=True)
+    split_cour = Column(Boolean, nullable=True, default=None)
 
 
 class Episode(Base):
@@ -97,6 +114,9 @@ class Episode(Base):
     title_en = Column(String, nullable=True)
     title_localized = Column(String, nullable=True)
     synopsis_localized = Column(Text, nullable=True)
+    still_path = Column(String, nullable=True)
+    air_date = Column(String, nullable=True)
+    episode_type = Column(String, nullable=True)
 
 
 class SeasonItem(Base):
@@ -108,6 +128,7 @@ class SeasonItem(Base):
     id = Column(Integer, primary_key=True)
     season_id = Column(Integer, ForeignKey('season.id', ondelete='CASCADE'), nullable=False, unique=True)
     media_item_id = Column(Integer, ForeignKey('media_item.id', ondelete='CASCADE'), nullable=False, unique=True)
+    media_id = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 
@@ -256,6 +277,9 @@ class PlayHistory(Base):
     play_count = Column(Integer, nullable=True, default=0)
     last_played = Column(DateTime, nullable=True)
     watched = Column(Boolean, nullable=True, default=False)
+    last_position = Column(Float, nullable=True)  # seconds
+    last_duration = Column(Float, nullable=True)  # seconds
+    last_path = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow)
 

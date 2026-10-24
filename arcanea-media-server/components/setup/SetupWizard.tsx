@@ -1,14 +1,16 @@
 import React, { useEffect, useState } from 'react';
 import { UserProfile, MetadataConfig } from '../../types';
 import { Button } from '../ui/Button';
-import { MediaService } from '../../services/api';
+import { MediaService, setAdminMode } from '../../services/api';
 import { ChevronRight, FolderPlus, Database, User, Check, HardDrive, Trash2, ArrowRight } from 'lucide-react';
-import { defaultMetadataLanguageForUiLang, detectSystemUiLang, getStoredUiLang, getStoredUiLangSource, uiLangFromLocale, useI18n } from '../../i18n/i18n';
-import { FolderPickerModal } from './FolderPickerModal';
+import { detectSystemLocale, detectSystemUiLang, getStoredUiLang, getStoredUiLangSource, normalizeMetadataLanguageFromLocale, uiLangFromLocale, useI18n } from '../../i18n/i18n';
+import { FolderPickerModal } from '../settings/FolderPickerModal';
 
 interface SetupWizardProps {
   onComplete: (profile: UserProfile, paths: string[], metadata: MetadataConfig) => void;
 }
+
+type RootTypeChoice = 'auto' | 'movie' | 'series' | 'anime';
 
 const AVATAR_COLORS = [
   'bg-indigo-600', 'bg-purple-600', 'bg-pink-600', 'bg-red-600', 
@@ -21,17 +23,19 @@ export const SetupWizard: React.FC<SetupWizardProps> = ({ onComplete }) => {
   const storedUiLang = getStoredUiLang();
   const initialUiLang = storedUiLang ?? systemUiLang;
   const defaultUiLocale = initialUiLang === 'es' ? 'es-419' : 'en-US';
-  const defaultProviderLanguage = defaultMetadataLanguageForUiLang(initialUiLang);
+  const defaultProviderLanguage = normalizeMetadataLanguageFromLocale(detectSystemLocale());
   const [step, setStep] = useState(1);
   
    // Paso 1: Perfil
   const [managerName, setManagerName] = useState('');
   const [managerLanguage, setManagerLanguage] = useState(defaultUiLocale);
   const [managerPin, setManagerPin] = useState('');
+  const [pinRequired, setPinRequired] = useState(true);
   const [langTouched, setLangTouched] = useState(false);
   
    // Paso 2: Bibliotecas
   const [paths, setPaths] = useState<string[]>([]);
+  const [pathTypes, setPathTypes] = useState<Record<string, RootTypeChoice>>({});
   const [pathInput, setPathInput] = useState('');
   const [pickerOpen, setPickerOpen] = useState(false);
   const [tmdbLocalization, setTmdbLocalization] = useState<boolean>(systemUiLang === 'es');
@@ -39,13 +43,14 @@ export const SetupWizard: React.FC<SetupWizardProps> = ({ onComplete }) => {
    // Paso 3: Metadatos
   const [metadata, setMetadata] = useState<MetadataConfig>({
     moviesProvider: 'tmdb',
-    animeProvider: 'jikan',
+    animeProvider: 'kitsu',
     language: defaultProviderLanguage,
     downloadImages: true,
     fetchCast: true
   });
    // TMDB API key (opcional)
   const [tmdbApiKey, setTmdbApiKey] = useState('');
+  const [showTmdbKey, setShowTmdbKey] = useState(false);
   const [tmdbStatusMsg, setTmdbStatusMsg] = useState<string | null>(null);
    const [tmdbChecking, setTmdbChecking] = useState(false);
 
@@ -53,14 +58,16 @@ export const SetupWizard: React.FC<SetupWizardProps> = ({ onComplete }) => {
     if (step === 1) {
       const pinRaw = String(managerPin || '').replace(/\D/g, '');
       const pin = pinRaw ? pinRaw.slice(0, 6) : '';
-      if (!pin || pin.length < 4) {
-        window.alert(t('manager_pin_required_alert'));
-        return;
-      }
-      const res = await MediaService.adminLogin(pin);
-      if (!res?.ok) {
-        window.alert(t('pin_incorrect'));
-        return;
+      if (pinRequired) {
+        if (!pin || pin.length < 4) {
+          window.alert(t('manager_pin_required_alert'));
+          return;
+        }
+        const res = await MediaService.adminLogin(pin);
+        if (!res?.ok) {
+          window.alert(t('pin_incorrect'));
+          return;
+        }
       }
     }
     setStep(prev => prev + 1);
@@ -72,6 +79,20 @@ export const SetupWizard: React.FC<SetupWizardProps> = ({ onComplete }) => {
     const stored = getStoredUiLang();
     const source = getStoredUiLangSource();
     if (!stored && source !== 'manual') setLang(systemUiLang, 'system');
+    (async () => {
+      try {
+        const status = await MediaService.getAdminStatus();
+        if (typeof status?.pin_required === 'boolean') {
+          setPinRequired(status.pin_required);
+          if (!status.pin_required) {
+            // Allow admin headers during bootstrap when no PIN is set yet.
+            setAdminMode(true);
+          }
+        }
+      } catch {
+        // ignore
+      }
+    })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -82,8 +103,17 @@ export const SetupWizard: React.FC<SetupWizardProps> = ({ onComplete }) => {
     const source = getStoredUiLangSource();
     const effectiveSource = langTouched ? 'manual' : ((source === 'manual' || stored) ? 'manual' : 'system');
     setLang(ui, effectiveSource);
-    setMetadata((m) => ({ ...m, language: defaultMetadataLanguageForUiLang(ui) }));
+    setMetadata((m) => ({ ...m, language: normalizeMetadataLanguageFromLocale(managerLanguage) }));
   }, [managerLanguage, langTouched, setLang]);
+
+  const inferRootTypeForPath = (path: string): RootTypeChoice => {
+    const last = String(path || '').split(/[\\/]+/).filter(Boolean).slice(-1)[0] || '';
+    const s = last.toLowerCase();
+    if (/(^|[^a-z])anime([^a-z]|$)/.test(s) || /animes?/.test(s)) return 'anime';
+    if (/(^|[^a-z])(series|serie|tv|shows?)([^a-z]|$)/.test(s)) return 'series';
+    if (/(^|[^a-z])(movies?|peliculas?|films?)([^a-z]|$)/.test(s)) return 'movie';
+    return 'auto';
+  };
 
   const handleFinish = () => {
     const pinRaw = String(managerPin || '').replace(/\\D/g, '');
@@ -105,6 +135,11 @@ export const SetupWizard: React.FC<SetupWizardProps> = ({ onComplete }) => {
       // Persistir configuración al backend
       (async () => {
          try {
+             const media_root_types: Record<string, string> = {};
+             for (const p of paths) {
+               const ty = pathTypes[p] ?? 'auto';
+               if (ty !== 'auto') media_root_types[p] = ty;
+             }
              const cfg = {
                 setupComplete: true,
                // Ajustes: idioma UI/proveedor y localización
@@ -113,9 +148,11 @@ export const SetupWizard: React.FC<SetupWizardProps> = ({ onComplete }) => {
                tmdb_localization: tmdbLocalization,
                admin_pin: pin,
                profiles: [managerProfile],
-                metadata: metadata,
-                media_roots: paths,
-             };
+                 metadata: metadata,
+                 media_roots: paths,
+                 media_root_types,
+                 loose_movie_roots: [],
+              };
              await MediaService.saveAppConfig(cfg);
             // Guardar credenciales TMDB (si hay) y validar
             if (tmdbApiKey && tmdbApiKey.trim()) {
@@ -150,8 +187,10 @@ export const SetupWizard: React.FC<SetupWizardProps> = ({ onComplete }) => {
   };
 
   const addPath = () => {
-    if (pathInput && !paths.includes(pathInput)) {
-      setPaths([...paths, pathInput]);
+    const p = String(pathInput || '').trim();
+    if (p && !paths.includes(p)) {
+      setPaths([...paths, p]);
+      setPathTypes((prev) => (prev[p] ? prev : { ...prev, [p]: inferRootTypeForPath(p) }));
       setPathInput('');
     }
   };
@@ -160,6 +199,11 @@ export const SetupWizard: React.FC<SetupWizardProps> = ({ onComplete }) => {
 
   const removePath = (path: string) => {
     setPaths(paths.filter(p => p !== path));
+    setPathTypes((prev) => {
+      const next = { ...prev };
+      delete next[path];
+      return next;
+    });
   };
 
   return (
@@ -295,15 +339,32 @@ export const SetupWizard: React.FC<SetupWizardProps> = ({ onComplete }) => {
                         </div>
                      ) : (
                         <div className="space-y-2">
-                           {paths.map((path, i) => (
-                              <div key={i} className="flex items-center justify-between p-3 bg-slate-800/50 rounded-lg group">
-                                 <div className="flex items-center space-x-3">
+                           {paths.map((path) => (
+                               <div key={path} className="flex items-center justify-between p-3 bg-slate-800/50 rounded-lg group">
+                                 <div className="flex items-center space-x-3 min-w-0">
                                     <FolderPlus size={16} className="text-indigo-400" />
-                                    <span className="font-mono text-sm text-slate-300">{path}</span>
+                                    <span className="font-mono text-sm text-slate-300 truncate">{path}</span>
                                  </div>
-                                 <button onClick={() => removePath(path)} className="text-slate-500 hover:text-red-400 transition-colors">
-                                    <Trash2 size={16} />
-                                 </button>
+                                 <div className="flex items-center gap-2">
+                                   <label className="sr-only">{t('root_type_label')}</label>
+                                   <select
+                                     value={pathTypes[path] ?? 'auto'}
+                                     onChange={(e) => {
+                                       const v = String(e.target.value || 'auto') as RootTypeChoice;
+                                       setPathTypes((prev) => ({ ...prev, [path]: v }));
+                                     }}
+                                     className="bg-slate-900/50 border border-white/10 rounded-lg px-2 py-1 text-xs text-white focus:ring-2 focus:ring-indigo-500 outline-none"
+                                     title={t('root_type_label')}
+                                   >
+                                     <option value="auto">{t('root_type_auto')}</option>
+                                     <option value="movie">{t('root_type_movies')}</option>
+                                     <option value="series">{t('root_type_series')}</option>
+                                     <option value="anime">{t('root_type_anime')}</option>
+                                   </select>
+                                   <button onClick={() => removePath(path)} className="text-slate-500 hover:text-red-400 transition-colors">
+                                      <Trash2 size={16} />
+                                   </button>
+                                 </div>
                               </div>
                            ))}
                         </div>
@@ -344,7 +405,7 @@ export const SetupWizard: React.FC<SetupWizardProps> = ({ onComplete }) => {
                            <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">{t('tmdb_api_key_optional')}</label>
                                         <div className="flex gap-2">
                                              <input
-                                                 type="text"
+                                                 type={showTmdbKey ? 'text' : 'password'}
                                                  value={tmdbApiKey}
                                                  onChange={(e) => setTmdbApiKey(e.target.value)}
                                                  placeholder={t('tmdb_api_key_placeholder_short')}
@@ -370,6 +431,15 @@ export const SetupWizard: React.FC<SetupWizardProps> = ({ onComplete }) => {
                                                 }
                                              }}>{tmdbChecking ? t('checking') : t('validate')}</Button>
                                         </div>
+                           <label className="mt-2 inline-flex items-center gap-2 text-xs text-slate-400">
+                             <input
+                               type="checkbox"
+                               checked={showTmdbKey}
+                               onChange={(e) => setShowTmdbKey(e.target.checked)}
+                               className="rounded border-slate-600 bg-slate-800 text-indigo-500 focus:ring-indigo-500"
+                             />
+                             {t('show')}
+                           </label>
                            <div className="mt-4 flex items-start gap-3 rounded-xl border border-white/10 bg-slate-800/30 p-4">
                              <input
                                type="checkbox"
@@ -390,21 +460,28 @@ export const SetupWizard: React.FC<SetupWizardProps> = ({ onComplete }) => {
                            )}
                         </div>
 
-                     <div>
-                        <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">{t('anime_agent')}</label>
-                        <div className="grid grid-cols-3 gap-4">
-                           {['jikan', 'anilist', 'kitsu'].map((provider) => (
-                              <div 
-                                 key={provider}
-                                 onClick={() => setMetadata({...metadata, animeProvider: provider as any})}
-                                 className={`cursor-pointer p-4 rounded-xl border-2 transition-all ${metadata.animeProvider === provider ? 'border-purple-500 bg-purple-500/10' : 'border-slate-700 bg-slate-800/30 hover:border-slate-500'}`}
-                              >
-                                 <div className="font-bold text-white capitalize mb-1">{provider}</div>
-                                 <div className="text-xs text-slate-400">{t('anime_metadata')}</div>
-                              </div>
-                           ))}
-                        </div>
-                     </div>
+                      <div>
+                         <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">{t('anime_agent')}</label>
+                         <div className="grid grid-cols-2 gap-4">
+                            {[
+                              { id: 'jikan', title: 'Jikan', hint: 'MyAnimeList (recomendado)' },
+                              { id: 'kitsu', title: 'Kitsu', hint: 'Alternativa (mas estable)' },
+                            ].map((p) => (
+                               <div
+                                  key={p.id}
+                                  onClick={() => setMetadata({ ...metadata, animeProvider: p.id as any })}
+                                  className={`cursor-pointer p-4 rounded-xl border-2 transition-all ${
+                                    metadata.animeProvider === p.id
+                                      ? 'border-purple-500 bg-purple-500/10'
+                                      : 'border-slate-700 bg-slate-800/30 hover:border-slate-500'
+                                  }`}
+                               >
+                                  <div className="font-bold text-white mb-1">{p.title}</div>
+                                  <div className="text-xs text-slate-400">{p.hint}</div>
+                               </div>
+                            ))}
+                         </div>
+                      </div>
                   </div>
                </div>
             )}
@@ -413,10 +490,28 @@ export const SetupWizard: React.FC<SetupWizardProps> = ({ onComplete }) => {
               open={pickerOpen}
               onClose={() => setPickerOpen(false)}
               title={t('select_library')}
-              onPick={(p) => {
-                const path = String(p || '').trim();
-                if (!path) return;
-                setPaths((prev) => (prev.includes(path) ? prev : [...prev, path]));
+              onConfirm={(picked) => {
+                const list = Array.isArray(picked) ? picked : [];
+                if (!list.length) {
+                  setPickerOpen(false);
+                  return;
+                }
+                setPaths((prev) => {
+                  const next = [...prev];
+                  for (const p of list) {
+                    const path = String(p || '').trim();
+                    if (path && !next.includes(path)) next.push(path);
+                  }
+                  return next;
+                });
+                setPathTypes((prev) => {
+                  const next = { ...prev };
+                  for (const p of list) {
+                    const path = String(p || '').trim();
+                    if (path && !next[path]) next[path] = inferRootTypeForPath(path);
+                  }
+                  return next;
+                });
                 setPickerOpen(false);
               }}
             />

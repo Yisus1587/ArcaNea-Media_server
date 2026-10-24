@@ -11,6 +11,7 @@ export const ArcaneaCircuitLoader: React.FC<Props> = ({ className, strokeWidth =
       <style>{`
         @keyframes arcanea-spin { to { transform: rotate(360deg); } }
         @keyframes arcanea-spin-beam { to { transform: rotate(360deg); } }
+        @keyframes arcanea-spin-slow { to { transform: rotate(-360deg); } }
         @keyframes arcanea-pulse {
           0%, 100% { opacity: 0.82; filter: drop-shadow(0 0 0 rgba(99, 102, 241, 0)); }
           50% { opacity: 1; filter: drop-shadow(0 0 18px rgba(99, 102, 241, 0.22)); }
@@ -27,10 +28,15 @@ export const ArcaneaCircuitLoader: React.FC<Props> = ({ className, strokeWidth =
       <svg viewBox="0 0 512 512" className="w-full h-auto" role="img" aria-label="ArcaNea loader">
         <defs>
           <linearGradient id="arcanea-grad" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0%" stopColor="#00c2ff" />
-            <stop offset="42%" stopColor="#2563eb" />
-            <stop offset="72%" stopColor="#a855f7" />
-            <stop offset="100%" stopColor="#d946ef" />
+            <stop offset="0%" stopColor="#22d3ee" />
+            <stop offset="40%" stopColor="#3b82f6" />
+            <stop offset="70%" stopColor="#a855f7" />
+            <stop offset="100%" stopColor="#f472b6" />
+          </linearGradient>
+          <linearGradient id="arcanea-core" x1="0" y1="1" x2="1" y2="0">
+            <stop offset="0%" stopColor="#0ea5e9" />
+            <stop offset="55%" stopColor="#6366f1" />
+            <stop offset="100%" stopColor="#f472b6" />
           </linearGradient>
           <radialGradient id="arcanea-glow" cx="50%" cy="45%" r="62%">
             <stop offset="0%" stopColor="rgba(99,102,241,0.22)" />
@@ -57,6 +63,21 @@ export const ArcaneaCircuitLoader: React.FC<Props> = ({ className, strokeWidth =
           />
         </g>
 
+        {/* counter-orbit */}
+        <g style={{ transformOrigin: '256px 256px', animation: 'arcanea-spin-slow 6.2s linear infinite', opacity: 0.6 }}>
+          <circle cx="256" cy="256" r="132" fill="none" stroke="rgba(148,163,184,0.18)" strokeWidth="1.6" />
+          <circle
+            cx="256"
+            cy="256"
+            r="132"
+            fill="none"
+            stroke="url(#arcanea-grad)"
+            strokeWidth="2.4"
+            strokeLinecap="round"
+            strokeDasharray="90 480"
+          />
+        </g>
+
         {/* scan beam */}
         <g style={{ transformOrigin: '256px 256px', animation: 'arcanea-spin-beam 1.75s linear infinite', opacity: 0.9 }}>
           <path d="M256 256 L256 62 A 194 194 0 0 1 372 106 Z" fill="rgba(99,102,241,0.07)" />
@@ -71,6 +92,20 @@ export const ArcaneaCircuitLoader: React.FC<Props> = ({ className, strokeWidth =
 
         {/* logo strokes */}
         <g filter="drop-shadow(0 10px 30px rgba(0,0,0,0.18))">
+          {/* core badge */}
+          <g style={{ animation: 'arcanea-pulse 2.4s ease-in-out infinite' }}>
+            <path
+              d="M256 148 L326 188 L326 272 L256 312 L186 272 L186 188 Z"
+              fill="rgba(11,18,32,0.75)"
+              stroke="url(#arcanea-core)"
+              strokeWidth="5"
+            />
+            <path
+              d="M256 168 L302 194 L302 266 L256 292 L210 266 L210 194 Z"
+              fill="url(#arcanea-core)"
+              opacity="0.12"
+            />
+          </g>
           {[
             { id: 'aOuter', d: 'M 132 410 L 256 108 L 380 410', delay: 0 },
             { id: 'aLeft', d: 'M 170 410 L 256 198', delay: 0.06 },
@@ -144,4 +179,3 @@ export const ArcaneaCircuitLoader: React.FC<Props> = ({ className, strokeWidth =
     </div>
   );
 };
-

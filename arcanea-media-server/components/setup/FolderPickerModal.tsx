@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { X, ArrowLeft, Folder, HardDrive, Check } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { MediaService } from '../../services/api';
@@ -62,9 +63,10 @@ export function FolderPickerModal(props: {
   }, [open, onClose]);
 
   if (!open) return null;
+  if (typeof document === 'undefined') return null;
 
-  return (
-    <div className="fixed inset-0 z-[240] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
+  const modal = (
+    <div translate="no" className="notranslate fixed inset-0 z-[240] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
       <div className="w-full max-w-2xl rounded-2xl bg-slate-900/90 border border-white/10 shadow-2xl overflow-hidden">
         <div className="flex items-center justify-between px-5 py-4 border-b border-white/10">
           <div className="flex items-center gap-3 min-w-0">
@@ -89,6 +91,7 @@ export function FolderPickerModal(props: {
         <div className="px-5 py-4">
           <div className="flex items-center gap-2 mb-3">
             <Button
+              type="button"
               size="sm"
               variant="ghost"
               onClick={() => setCurPath(parent)}
@@ -99,6 +102,7 @@ export function FolderPickerModal(props: {
             </Button>
             <div className="flex-1" />
             <Button
+              type="button"
               size="sm"
               onClick={() => {
                 if (!canPick) return;
@@ -147,4 +151,5 @@ export function FolderPickerModal(props: {
       </div>
     </div>
   );
+  return createPortal(modal, document.body);
 }

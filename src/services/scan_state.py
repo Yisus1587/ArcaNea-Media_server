@@ -5,9 +5,15 @@ from typing import Any, Dict
 _lock = threading.Lock()
 _state: Dict[str, Any] = {
     'status': 'idle',
+    'phase': 'idle',
     'total': 0,
     'processed': 0,
+    'titles_total': 0,
+    'titles_processed': 0,
+    'queued': 0,
     'current': None,
+    'task_id': None,
+    'task_kind': None,
     'started_at': None,
     'finished_at': None,
     'last_updated': None,
@@ -28,4 +34,4 @@ def get_state() -> Dict[str, Any]:
 
 def clear_state():
     with _lock:
-        _state.update({'status': 'idle', 'current': None, 'started_at': None, 'finished_at': None})
+        _state.update({'status': 'idle', 'phase': 'idle', 'current': None, 'task_id': None, 'task_kind': None, 'started_at': None, 'finished_at': None})

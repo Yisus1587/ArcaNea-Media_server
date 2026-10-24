@@ -1,4 +1,5 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { X, Folder, HardDrive, ChevronLeft, CheckSquare, Square, Loader2, RefreshCw } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { MediaService } from '../../services/api';
@@ -7,7 +8,27 @@ import { useI18n } from '../../i18n/i18n';
 type Entry = { name: string; path: string; type: string };
 
 function _labelFor(entry: Entry): string {
-  return entry.name || entry.path || '—';
+  return entry.name || entry.path || '-';
+}
+
+function _normalizeEntries(raw: unknown): Entry[] {
+  if (!Array.isArray(raw)) return [];
+  const out: Entry[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    const rec = (item || {}) as Record<string, unknown>;
+    const path = String(rec.path || '').trim();
+    if (!path) continue;
+    const dedupeKey = path.toLowerCase();
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    out.push({
+      name: String(rec.name || path),
+      path,
+      type: String(rec.type || 'folder'),
+    });
+  }
+  return out;
 }
 
 export function FolderPickerModal(props: {
@@ -24,35 +45,56 @@ export function FolderPickerModal(props: {
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const mountedRef = useRef(false);
+  const openRef = useRef(open);
+  const requestSeqRef = useRef(0);
 
   const selectedPaths = useMemo(() => Object.keys(selected).filter((k) => selected[k]), [selected]);
 
-  const load = async (path: string | null) => {
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      requestSeqRef.current += 1;
+    };
+  }, []);
+
+  useEffect(() => {
+    openRef.current = open;
+    if (!open) requestSeqRef.current += 1;
+  }, [open]);
+
+  const load = useCallback(async (path: string | null) => {
+    const reqId = ++requestSeqRef.current;
     setLoading(true);
     setError(null);
     try {
       const res = await MediaService.listDirectories(path);
+      if (!mountedRef.current || !openRef.current || reqId !== requestSeqRef.current) return;
       setCurrentPath(res.path);
       setParent(res.parent);
-      setEntries(res.entries || []);
+      setEntries(_normalizeEntries(res.entries));
     } catch (e) {
+      if (!mountedRef.current || !openRef.current || reqId !== requestSeqRef.current) return;
       setError(String(e));
       setEntries([]);
     } finally {
-      setLoading(false);
+      if (mountedRef.current && openRef.current && reqId === requestSeqRef.current) {
+        setLoading(false);
+      }
     }
-  };
+  }, []);
 
   useEffect(() => {
     if (!open) return;
     void load(null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
+  }, [open, load]);
 
   if (!open) return null;
+  if (typeof document === 'undefined') return null;
 
-  return (
-    <div className="fixed inset-0 z-[240] flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+  const modal = (
+    <div translate="no" className="notranslate fixed inset-0 z-[240] flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
       <div className="w-full max-w-3xl rounded-2xl border border-white/10 bg-slate-950/90 shadow-2xl overflow-hidden">
         <div className="flex items-center justify-between px-5 py-4 border-b border-white/10">
           <div className="min-w-0">
@@ -62,6 +104,7 @@ export function FolderPickerModal(props: {
             </div>
           </div>
           <button
+            type="button"
             onClick={onClose}
             className="p-2 rounded-lg text-slate-300 hover:text-white hover:bg-white/10 transition"
             aria-label={t('close')}
@@ -72,6 +115,7 @@ export function FolderPickerModal(props: {
 
         <div className="px-5 py-3 flex items-center gap-2">
           <Button
+            type="button"
             size="sm"
             variant="ghost"
             onClick={() => void load(parent)}
@@ -81,6 +125,7 @@ export function FolderPickerModal(props: {
             {t('back')}
           </Button>
           <Button
+            type="button"
             size="sm"
             variant="ghost"
             onClick={() => void load(currentPath)}
@@ -110,13 +155,13 @@ export function FolderPickerModal(props: {
             </div>
           ) : (
             <div className="space-y-1">
-              {entries.map((e) => {
+              {entries.map((e, idx) => {
                 const key = e.path;
                 const isSelected = !!selected[key];
                 const isDrive = (e.type || '').toLowerCase() === 'drive';
                 return (
                   <div
-                    key={key}
+                    key={`${key}::${idx}`}
                     className="flex items-center gap-3 px-3 py-2 rounded-xl hover:bg-white/5 border border-transparent hover:border-white/5 transition"
                   >
                     <button
@@ -151,8 +196,9 @@ export function FolderPickerModal(props: {
         </div>
 
         <div className="px-5 py-4 border-t border-white/10 flex items-center justify-end gap-2">
-          <Button variant="ghost" onClick={onClose}>{t('cancel')}</Button>
+          <Button type="button" variant="ghost" onClick={onClose}>{t('cancel')}</Button>
           <Button
+            type="button"
             onClick={() => onConfirm(selectedPaths)}
             disabled={selectedPaths.length === 0}
             icon={<Folder size={16} />}
@@ -163,4 +209,5 @@ export function FolderPickerModal(props: {
       </div>
     </div>
   );
+  return createPortal(modal, document.body);
 }

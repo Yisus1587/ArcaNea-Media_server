@@ -9,19 +9,40 @@ Exports:
 from sqlalchemy import create_engine
 from sqlalchemy import event
 from sqlalchemy.orm import sessionmaker
+from contextlib import contextmanager
 import logging
 import os
-from ..core.config import get
+from ..core.config import get, DATA_DIR
 
 logger = logging.getLogger(__name__)
 
 # Build DB URL from config (defaults handled in core.config)
-DB_URL = get('db_url') or os.environ.get('ARCANEA_DB_URL') or f"sqlite:///data/arcanea.db"
+_default_db_path = (DATA_DIR / "arcanea.db").resolve()
+_default_db_url = f"sqlite:///{_default_db_path.as_posix()}"
+DB_URL = get('db_url') or os.environ.get('ARCANEA_DB_URL') or _default_db_url
 
 # Create engine and session factory
 _sqlite_connect_args = {"check_same_thread": False, "timeout": 30} if DB_URL.startswith('sqlite') else {}
 engine = create_engine(DB_URL, connect_args=_sqlite_connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+@contextmanager
+def session_scope(*, commit: bool = False):
+    """Context-managed DB session with optional commit and rollback on error."""
+    session = SessionLocal()
+    try:
+        yield session
+        if commit:
+            session.commit()
+    except Exception:
+        try:
+            session.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        session.close()
 
 def _sqlite_normalize_journal_mode(v: str | None) -> str | None:
     if not v:
@@ -50,7 +71,7 @@ if DB_URL.startswith('sqlite'):
             try:
                 # Enforce FK constraints across normalized tables.
                 cur.execute("PRAGMA foreign_keys=ON")
-                cur.execute("PRAGMA busy_timeout=5000")
+                cur.execute("PRAGMA busy_timeout=30000")
                 if _jm:
                     cur.execute(f"PRAGMA journal_mode={_jm}")
                 if _sync:

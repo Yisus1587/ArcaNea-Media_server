@@ -1,29 +1,53 @@
 <svg width="600" height="900" viewBox="0 0 600 900" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <title>ARCANEA - Local Media Server Poster</title>
+  <desc>Poster image for ARCANEA media server with gradient background and decorative elements optimized for vertical display</desc>
+  
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+    <style>
+      .arcanea-text-primary { fill: #E6E9FF; font-family: 'Segoe UI', Arial, sans-serif; font-weight: 700; }
+      .arcanea-text-secondary { fill: #A9B3D9; font-family: 'Segoe UI', Arial, sans-serif; }
+      .arcanea-shape-blur { opacity: 0.25; filter: blur(1px); }
+      .arcanea-accent-lines { opacity: 0.6; stroke-linecap: round; stroke-linejoin: round; }
+    </style>
+    
+    <!-- Background gradient: dark theme with purple accent -->
+    <linearGradient id="bg-poster" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#0B0F1A"/>
       <stop offset="50%" stop-color="#171B2C"/>
       <stop offset="100%" stop-color="#2B1B3D"/>
     </linearGradient>
-    <radialGradient id="glow" cx="0.5" cy="0.4" r="0.7">
+    
+    <!-- Radial glow effect optimized for poster format -->
+    <radialGradient id="glow-poster" cx="50%" cy="40%" r="70%">
       <stop offset="0%" stop-color="#5B6CFF" stop-opacity="0.35"/>
+      <stop offset="70%" stop-color="#7B5CFF" stop-opacity="0.15"/>
       <stop offset="100%" stop-color="#5B6CFF" stop-opacity="0"/>
     </radialGradient>
   </defs>
-  <rect width="600" height="900" rx="28" fill="url(#bg)"/>
-  <rect width="600" height="900" rx="28" fill="url(#glow)"/>
-  <g opacity="0.25">
+  
+  <!-- Background rectangles -->
+  <rect width="600" height="900" rx="28" fill="url(#bg-poster)"/>
+  <rect width="600" height="900" rx="28" fill="url(#glow-poster)"/>
+  
+  <!-- Decorative blur circles -->
+  <g class="arcanea-shape-blur">
     <circle cx="480" cy="160" r="120" fill="#6D7BFF"/>
     <circle cx="140" cy="740" r="160" fill="#9A4DFF"/>
   </g>
-  <g opacity="0.6">
-    <path d="M120 420C210 330 320 330 410 420" stroke="#7C8CFF" stroke-width="6" stroke-linecap="round"/>
-    <path d="M150 480C230 410 300 410 380 480" stroke="#A975FF" stroke-width="6" stroke-linecap="round"/>
+  
+  <!-- Accent curves -->
+  <g class="arcanea-accent-lines">
+    <path d="M120 420C210 330 320 330 410 420" stroke="#7C8CFF" stroke-width="6"/>
+    <path d="M150 480C230 410 300 410 380 480" stroke="#A975FF" stroke-width="6"/>
   </g>
-  <text x="50%" y="54%" text-anchor="middle" fill="#E6E9FF" font-family="Segoe UI, Arial, sans-serif" font-size="44" font-weight="700" letter-spacing="1">
+  
+  <!-- Title text -->
+  <text x="50%" y="54%" text-anchor="middle" dominant-baseline="middle" font-size="44" letter-spacing="1" class="arcanea-text-primary">
     ARCANEA
   </text>
-  <text x="50%" y="60%" text-anchor="middle" fill="#A9B3D9" font-family="Segoe UI, Arial, sans-serif" font-size="18" letter-spacing="2">
+  
+  <!-- Subtitle text -->
+  <text x="50%" y="60%" text-anchor="middle" dominant-baseline="middle" font-size="18" letter-spacing="2" class="arcanea-text-secondary">
     LOCAL MEDIA
   </text>
 </svg>

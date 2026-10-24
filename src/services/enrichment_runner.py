@@ -1,15 +1,18 @@
 import threading
 import time
 import logging
+import os
 from typing import Optional
 
-from ..db import SessionLocal
+from ..db import SessionLocal, session_scope
 from ..db import models
-from .enrichment import enrich_one
+from .enrichment import enrich_one, enrich_one_item
 from ..core.config import get
 from .enrich_state import set_state, clear_state, get_state as get_enrich_state
+from .scan_state import get_state as get_scan_state
 from . import enrichment as enrichment_service
-from .localize_runner import start_localization_job
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +21,14 @@ _run_lock = threading.Lock()
 _enrich_call_lock = threading.Lock()
 _paused = threading.Event()
 _stop = threading.Event()
+_attempts: dict[int, int] = {}
+try:
+    _ENRICH_MAX_RETRIES = int(str(get("enrichment_max_retries") or "1"))
+except Exception:
+    _ENRICH_MAX_RETRIES = 1
+
+# Max workers for parallel ingestion.
+_ENRICH_WORKERS = max(1, int(str(os.environ.get("ARCANEA_ENRICH_WORKERS") or "4")))
 
 
 def set_paused(paused: bool) -> None:
@@ -64,23 +75,67 @@ def clear_stop() -> None:
 
 
 def enrich_one_serialized(media_item_id: int, providers_override=None, force_media_type=None) -> bool:
-    """Run enrich_one under a global lock.
+    """Run enrichment for a single item.
 
-    Prevents overlapping provider calls/DB writes when the background runner is active
-    and the API also triggers per-item enrichment refreshes.
+    Important: when `providers_override` is provided (manual mapping / admin rematch),
+    it must be honored end-to-end by delegating to `enrich_one`, which already supports
+    provider overrides. Using `enrich_one_item` directly would ignore the override and
+    silently follow global provider config.
     """
-    with _enrich_call_lock:
-        return bool(enrich_one(int(media_item_id), providers_override=providers_override, force_media_type=force_media_type))
+    try:
+        return bool(
+            enrich_one(
+                int(media_item_id),
+                providers_override=providers_override,
+                force_media_type=force_media_type,
+            )
+        )
+    except Exception:
+        logger.exception("enrich_one_serialized failed for media_item %s", media_item_id)
+        return False
+    finally:
+        try:
+            with _run_lock:
+                global _running
+                _running = False
+        except Exception:
+            pass
+        try:
+            clear_state()
+        except Exception:
+            pass
 
+
+def enrich_from_tmdb_id_serialized(
+    *,
+    media_item_id: int,
+    tmdb_id: str,
+    media_type: str | None = None,
+    season_number: int | None = None,
+    language: str | None = None,
+    download_assets: bool | None = None,
+) -> dict:
+    """Run manual TMDB re-match."""
+    try:
+        return enrichment_service.enrich_from_tmdb_id(
+            media_item_id=int(media_item_id),
+            tmdb_id=str(tmdb_id),
+            media_type=media_type,
+            season_number=season_number,
+            language=language,
+            download_assets=download_assets,
+        )
+    except Exception as e:
+        logger.exception("Manual TMDB re-match failed for media_item %s", media_item_id)
+        return {"ok": False, "detail": str(e)}
 
 def backfill_episodes_for_media_item_serialized(media_item_id: int) -> dict:
-    """Backfill episode titles for one media item under a global lock."""
-    with _enrich_call_lock:
-        try:
-            return enrichment_service.backfill_tmdb_episode_titles_for_media_item(int(media_item_id), manage_state=True)
-        except Exception as e:
-            logger.exception("Backfill episodes failed for media_item %s", media_item_id)
-            return {"ok": False, "detail": str(e), "seasons_updated": 0, "episodes_updated": 0}
+    """Backfill episode titles for one media item."""
+    try:
+        return enrichment_service.backfill_tmdb_episode_titles_for_media_item(int(media_item_id), manage_state=True)
+    except Exception as e:
+        logger.exception("Backfill episodes failed for media_item %s", media_item_id)
+        return {"ok": False, "detail": str(e), "seasons_updated": 0, "episodes_updated": 0}
 
 
 def _fetch_pending_ids(session, limit: Optional[int] = None):
@@ -132,37 +187,67 @@ def _enrichment_worker(batch_size: int, rate_per_min: int):
 
             ids = _fetch_pending_ids(session, limit=batch_size)
             if not ids:
-                # Optional finalization: fill missing/generic episode titles from TMDB for TV seasons.
-                # This keeps the UI consistent without requiring manual API calls.
-                try:
-                    if not _stop.is_set():
-                        # Run localization as a separate job (can be triggered manually too).
-                        try:
-                            start_localization_job()
-                        except Exception:
-                            logger.exception("Final localization job failed to start")
-                except Exception:
-                    pass
-
                 logger.info('Enrichment runner: no pending items, exiting')
                 break
             delay = 60.0 / max(1, rate_per_min)
-            for mid in ids:
+
+            def _task(mid):
                 if _stop.is_set():
-                    break
+                    return None
                 while _paused.is_set() and not _stop.is_set():
-                    try:
-                        set_state({'running': True, 'paused': True, 'current_step': 'paused'})
-                    except Exception:
-                        pass
                     time.sleep(0.25)
+                if _stop.is_set():
+                    return None
+
                 try:
-                    # call enrich_one which will perform provider calls and persist metadata
-                    enrich_one_serialized(mid)
+                    ok = bool(enrich_one_serialized(mid))
+                    if not ok:
+                        # enrich_one_item() returns False for provider/network failures (transient) and
+                        # True when the item was handled (including true NO_MATCH cases, which the
+                        # enrichment code itself persists as status='NO_MATCH').
+                        #
+                        # Do NOT mark provider failures as NO_MATCH here; that incorrectly turns
+                        # timeouts (e.g. Jikan 504/ReadTimeout) into permanent no-match results.
+                        _attempts[mid] = _attempts.get(mid, 0) + 1
+                        if _attempts.get(mid, 0) >= _ENRICH_MAX_RETRIES:
+                            with session_scope(commit=True) as dbx:
+                                mi = dbx.query(models.MediaItem).filter(models.MediaItem.id == mid).first()
+                                if mi:
+                                    from typing import Any as _Any, cast as _cast
+                                    mi_any = _cast(_Any, mi)
+                                    # Use ERROR to indicate transient provider failure / retries exceeded.
+                                    # This keeps NO_MATCH reserved for true "no metadata match".
+                                    mi_any.status = "ERROR"
+                                    mi_any.is_identified = False
+                                    dbx.add(mi)
                 except Exception:
                     logger.exception('Enrichment failed for media_item %s', mid)
-                # sleep to respect approximate rate
-                time.sleep(delay)
+                    _attempts[mid] = _attempts.get(mid, 0) + 1
+                    if _attempts.get(mid, 0) >= _ENRICH_MAX_RETRIES:
+                        with session_scope(commit=True) as dbx:
+                            mi = dbx.query(models.MediaItem).filter(models.MediaItem.id == mid).first()
+                            if mi:
+                                from typing import Any as _Any, cast as _cast
+                                mi_any = _cast(_Any, mi)
+                                mi_any.status = "ERROR"
+                                mi_any.is_identified = False
+                                dbx.add(mi)
+                return mid
+
+            with ThreadPoolExecutor(max_workers=_ENRICH_WORKERS) as executor:
+                futures = []
+                for mid in ids:
+                    if _stop.is_set():
+                        break
+                    futures.append(executor.submit(_task, mid))
+                    # Stagger starts to respect approximate rate limit
+                    time.sleep(delay)
+                
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception:
+                        pass
             if _stop.is_set():
                 logger.info('Enrichment runner: stop requested, exiting')
                 break
@@ -189,6 +274,14 @@ def start_enrichment_job(batch_size: Optional[int] = None, rate_per_min: Optiona
     Reads defaults from config keys `enrichment_batch_size` and `enrichment_rate_per_min` when not provided.
     """
     global _running
+    # Do not start while a scan is running to avoid DB write locks.
+    try:
+        st_scan = get_scan_state()
+        if (st_scan.get("status") or "").lower() == "scanning":
+            logger.info("Enrichment start blocked: scan in progress")
+            return False
+    except Exception:
+        pass
     # Preflight: if there is nothing pending, don't start a runner thread. This prevents
     # repeated "idle" runs being triggered by the watcher/scan flow and avoids looping
     # finalization steps indefinitely.
@@ -229,8 +322,21 @@ def start_enrichment_job(batch_size: Optional[int] = None, rate_per_min: Optiona
     except Exception:
         pass
 
-    bs = int(batch_size or get('enrichment_batch_size') or 20)
-    rpm = int(rate_per_min or get('enrichment_rate_per_min') or 60)
+    if batch_size is None:
+        try:
+            bs = int(str(get('enrichment_batch_size') or "20"))
+        except Exception:
+            bs = 20
+    else:
+        bs = int(batch_size)
+
+    if rate_per_min is None:
+        try:
+            rpm = int(str(get('enrichment_rate_per_min') or "60"))
+        except Exception:
+            rpm = 60
+    else:
+        rpm = int(rate_per_min)
 
     t = threading.Thread(target=_enrichment_worker, args=(bs, rpm), daemon=True, name='enrichment-runner')
     t.start()

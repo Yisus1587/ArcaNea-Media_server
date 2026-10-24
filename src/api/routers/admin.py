@@ -14,6 +14,12 @@ from .app_config import _ensure_settings_table_exists
 router = APIRouter()
 
 
+@router.get("/api/admin/status")
+def admin_status():
+    required = get_required_admin_pin()
+    return {"pin_required": bool(required)}
+
+
 @router.post("/api/admin/login")
 def admin_login(payload: dict):
     if not isinstance(payload, dict):

@@ -6,6 +6,7 @@ interface UseProfilesStateParams {
   appStage: AppStage;
   metadataConfig: MetadataConfig;
   libraryPaths: string[];
+  looseMovieRoots: string[];
   currentUser: UserProfile | null;
   setCurrentUser: (u: UserProfile | null) => void;
   onLogout: () => void;
@@ -16,6 +17,7 @@ export const useProfilesState = ({
   appStage,
   metadataConfig,
   libraryPaths,
+  looseMovieRoots,
   currentUser,
   setCurrentUser,
   onLogout,
@@ -79,6 +81,7 @@ export const useProfilesState = ({
             profiles,
             metadata: metadataConfig,
             media_roots: libraryPaths,
+            loose_movie_roots: looseMovieRoots,
           });
         } catch {
           // ignore

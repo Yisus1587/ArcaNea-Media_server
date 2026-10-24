@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime
 from typing import Iterable
 
-from ..core.config import normalize_metadata_language
+from .config import normalize_metadata_language
 from ..db import models
 
 
@@ -37,6 +37,9 @@ def normalize_translation_language(lang: str | None) -> str:
     return s
 
 
+_SPANISH_FALLBACKS = ["es-ES", "es-AR", "es-CL", "es-CO", "es-PE", "es-VE", "es"]
+
+
 def build_language_fallback_chain(preferred: str | None) -> list[str]:
     """Return language preference chain for UI fields.
 
@@ -52,10 +55,9 @@ def build_language_fallback_chain(preferred: str | None) -> list[str]:
 
     low = p0.lower()
     if low.startswith("es-"):
-        if "es-ES" not in out:
-            out.append("es-ES")
-        if "es" not in out:
-            out.append("es")
+        for loc in _SPANISH_FALLBACKS:
+            if loc not in out:
+                out.append(loc)
     else:
         # add base language
         base = p0.split("-", 1)[0].lower() if p0 else ""
@@ -103,13 +105,51 @@ def upsert_translation(
     t = (title or "").strip() or None
     ov = (overview or "").strip() or None
 
-    row = (
-        db.query(models.MediaTranslation)
-        .filter(models.MediaTranslation.path_id == int(path_id))
-        .filter(models.MediaTranslation.language == lang_key)
-        .filter(models.MediaTranslation.source == src)
-        .first()
-    )
+    row = None
+    # Avoid duplicate inserts when autoflush is disabled by checking pending instances first.
+    try:
+        for obj in list(getattr(db, "new", []) or []):
+            if not isinstance(obj, models.MediaTranslation):
+                continue
+            try:
+                if int(getattr(obj, "path_id")) != int(path_id):
+                    continue
+                if normalize_translation_language(getattr(obj, "language", None)) != lang_key:
+                    continue
+                if str(getattr(obj, "source", "") or "").strip().lower() != src:
+                    continue
+                row = obj
+                break
+            except Exception:
+                continue
+    except Exception:
+        row = None
+    if row is None:
+        try:
+            for obj in list(getattr(db, "dirty", []) or []):
+                if not isinstance(obj, models.MediaTranslation):
+                    continue
+                try:
+                    if int(getattr(obj, "path_id")) != int(path_id):
+                        continue
+                    if normalize_translation_language(getattr(obj, "language", None)) != lang_key:
+                        continue
+                    if str(getattr(obj, "source", "") or "").strip().lower() != src:
+                        continue
+                    row = obj
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            row = None
+    if row is None:
+        row = (
+            db.query(models.MediaTranslation)
+            .filter(models.MediaTranslation.path_id == int(path_id))
+            .filter(models.MediaTranslation.language == lang_key)
+            .filter(models.MediaTranslation.source == src)
+            .first()
+        )
     if not row:
         row = models.MediaTranslation(path_id=int(path_id), language=lang_key, source=src)
 
@@ -131,6 +171,7 @@ def resolve_translation_fields(
     rows: Iterable[models.MediaTranslation],
     *,
     preferred_langs: list[str],
+    allow_jikan: bool = True,
 ) -> dict[str, str | None]:
     """Resolve title/overview using language chain + per-source ranking.
 
@@ -144,6 +185,12 @@ def resolve_translation_fields(
             lk = normalize_translation_language(getattr(r, "language", None))
         except Exception:
             continue
+        if not allow_jikan:
+            try:
+                if str(getattr(r, "source", "") or "").strip().lower() == "jikan":
+                    continue
+            except Exception:
+                continue
         by_lang.setdefault(lk, []).append(r)
 
     def pick(lang_key: str) -> models.MediaTranslation | None:
@@ -194,4 +241,3 @@ def preferred_lang_chain_from_config(get_fn) -> list[str]:
     except Exception:
         pass
     return build_language_fallback_chain(raw)
-

@@ -49,6 +49,7 @@ interface VideoPlayerProps {
   subtitlesUrl?: string;
   autoPlay?: boolean;
   startTime?: number;
+  onProgressUpdate?: (payload: { current: number; duration: number; progress: number; force?: boolean; ended?: boolean }) => void;
 }
 
 interface PlayerState {
@@ -203,6 +204,7 @@ const playerReducer = (state: PlayerState, action: PlayerAction): PlayerState =>
         progress: 0,
         buffered: 0,
         isIdle: false,
+        actionFeedback: null,
       };
     default:
       return state;
@@ -215,53 +217,90 @@ const ProgressBar: React.FC<{
   currentTime: number;
   duration: number;
   onSeek: (value: number) => void;
-}> = ({ progress, buffered, currentTime, duration, onSeek }) => {
-  const remaining = Math.max(0, (duration || 0) - (currentTime || 0));
+  compact?: boolean;
+}> = ({ progress, buffered, currentTime, duration, onSeek, compact = false }) => {
+  const [isHovering, setIsHovering] = useState(false);
+  const [hoverX, setHoverX] = useState(0);
+  const [hoverTime, setHoverTime] = useState(0);
+  const barRef = useRef<HTMLDivElement>(null);
+
+  const selectAtClientX = (clientX: number) => {
+    const rect = barRef.current?.getBoundingClientRect();
+    if (!rect || rect.width <= 0) return;
+    const x = Math.max(0, Math.min(clientX - rect.left, rect.width));
+    onSeek((x / rect.width) * 100);
+  };
+
+  const handleMouseMove = (e: React.MouseEvent) => {
+    if (!barRef.current) return;
+    const rect = barRef.current.getBoundingClientRect();
+    const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+    const percent = (x / rect.width) * 100;
+    setHoverX(percent);
+    setHoverTime((duration / 100) * percent);
+  };
+
+  const rightLabel = compact ? formatTime(duration) : `-${formatTime(Math.max(0, duration - currentTime))}`;
+
   return (
-  <div className="flex items-center gap-4 mb-4 group/timeline select-none">
-    <span className="text-xs font-medium text-slate-300 w-12 text-right font-mono">{formatTime(currentTime)}</span>
-
-    <div className="relative flex-1 h-1.5 hover:h-2.5 bg-white/10 rounded-full cursor-pointer transition-all duration-200 group/bar">
-      <input
-        type="range"
-        min="0"
-        max="100"
-        step="0.01"
-        value={progress}
-        onChange={(e) => onSeek(parseFloat(e.target.value))}
-        className="absolute inset-0 w-full h-full opacity-0 z-30 cursor-pointer"
-        aria-label="Buscar en el video"
-        role="slider"
-        aria-valuemin={0}
-        aria-valuemax={100}
-        aria-valuenow={Math.round(progress)}
-      />
-
-      <div className="absolute inset-0 rounded-full bg-white/10" aria-hidden="true" />
+    <div className={`flex items-center ${compact ? 'gap-2 mb-3' : 'gap-4 mb-4'} group/timeline select-none`}>
+      <span className={`font-medium text-slate-300 text-right font-mono ${compact ? 'text-[11px] w-10' : 'text-xs w-12'}`}>{formatTime(currentTime)}</span>
 
       <div
-        className="absolute top-0 left-0 h-full bg-white/30 rounded-full transition-all duration-300"
-        style={{ width: `${buffered}%` }}
-        aria-hidden="true"
-      />
-
-      <div
-        className="absolute top-0 left-0 h-full bg-indigo-500 rounded-full shadow-[0_0_10px_rgba(99,102,241,0.5)]"
-        style={{ width: `${progress}%` }}
-        aria-hidden="true"
-      />
-
-      <div
-        className="absolute h-4 w-4 bg-white rounded-full shadow-md scale-0 group-hover/bar:scale-100 transition-transform duration-150 pointer-events-none z-20"
-        style={{ left: `${progress}%`, transform: 'translateX(-50%)' }}
-        aria-hidden="true"
+        ref={barRef}
+        className={`relative flex-1 bg-white/10 rounded-full cursor-pointer transition-all duration-200 group/bar ${compact ? 'h-2 hover:h-2.5' : 'h-1.5 hover:h-2.5'}`}
+        onMouseEnter={() => setIsHovering(true)}
+        onMouseLeave={() => setIsHovering(false)}
+        onMouseMove={handleMouseMove}
+        onClick={(e) => selectAtClientX(e.clientX)}
+        onTouchStart={(e) => {
+          const touch = e.touches[0];
+          if (touch) selectAtClientX(touch.clientX);
+        }}
+        onTouchMove={(e) => {
+          const touch = e.touches[0];
+          if (touch) selectAtClientX(touch.clientX);
+        }}
       >
-        <div className="absolute inset-0 rounded-full bg-indigo-500 opacity-20 animate-pulse" />
-      </div>
-    </div>
+        <div className="absolute -inset-y-3 inset-x-0 z-10" />
 
-    <span className="text-xs font-medium text-slate-300 w-12 font-mono">-{formatTime(remaining)}</span>
-  </div>
+        {!compact && isHovering ? (
+          <>
+            <div
+              className="absolute bottom-full mb-3 px-2 py-1 bg-slate-900 border border-white/10 rounded text-[10px] font-mono text-white whitespace-nowrap -translate-x-1/2 pointer-events-none z-50 shadow-xl"
+              style={{ left: `${hoverX}%` }}
+            >
+              {formatTime(hoverTime)}
+            </div>
+            <div className="absolute h-full bg-white/20 rounded-full pointer-events-none z-10" style={{ width: `${hoverX}%` }} />
+          </>
+        ) : null}
+
+        <div className="absolute inset-0 rounded-full bg-white/10" aria-hidden="true" />
+
+        <div
+          className="absolute top-0 left-0 h-full bg-white/30 rounded-full transition-all duration-300 z-0"
+          style={{ width: `${buffered}%` }}
+          aria-hidden="true"
+        />
+
+        <div
+          className="absolute top-0 left-0 h-full bg-gradient-to-r from-indigo-600 to-indigo-400 rounded-full z-20 shadow-[0_0_10px_rgba(79,70,229,0.5)]"
+          style={{ width: `${progress}%` }}
+          aria-hidden="true"
+        />
+
+        <div
+          className={`absolute bg-white rounded-full shadow-lg transition-transform duration-150 pointer-events-none z-30 ring-4 ring-indigo-500/30 ${compact ? 'h-3.5 w-3.5' : 'h-4 w-4 scale-0 group-hover/bar:scale-100'}`}
+          style={{ left: `${progress}%`, transform: 'translateX(-50%)' }}
+          aria-hidden="true"
+        >
+          <div className="absolute inset-0 rounded-full bg-indigo-500 opacity-20 animate-pulse" />
+        </div>
+      </div>
+
+      <span className={`font-medium text-slate-300 font-mono ${compact ? 'text-[11px] w-10 text-right' : 'text-xs w-12'}`}>{rightLabel}</span>
+    </div>
   );
 };
 
@@ -270,12 +309,14 @@ const VolumeControl: React.FC<{
   isMuted: boolean;
   onVolumeChange: (value: number) => void;
   onMuteToggle: () => void;
-}> = ({ volume, isMuted, onVolumeChange, onMuteToggle }) => {
+  compact?: boolean;
+}> = ({ volume, isMuted, onVolumeChange, onMuteToggle, compact = false }) => {
+  const iconSize = compact ? 20 : 22;
   const volumeIcon = useMemo(() => {
-    if (isMuted || volume === 0) return <VolumeX size={22} />;
-    if (volume < 0.5) return <Volume1 size={22} />;
-    return <Volume2 size={22} />;
-  }, [isMuted, volume]);
+    if (isMuted || volume === 0) return <VolumeX size={iconSize} />;
+    if (volume < 0.5) return <Volume1 size={iconSize} />;
+    return <Volume2 size={iconSize} />;
+  }, [iconSize, isMuted, volume]);
 
   return (
     <div className="flex items-center group/volume relative">
@@ -287,18 +328,20 @@ const VolumeControl: React.FC<{
       >
         {volumeIcon}
       </button>
-      <div className="w-0 overflow-hidden group-hover/volume:w-24 transition-all duration-300 ease-out flex items-center ml-1">
-        <input
-          type="range"
-          min="0"
-          max="1"
-          step="0.05"
-          value={isMuted ? 0 : volume}
-          onChange={(e) => onVolumeChange(parseFloat(e.target.value))}
-          className="h-1 w-20 bg-white/30 rounded-lg appearance-none cursor-pointer accent-indigo-500 hover:accent-white"
-          aria-label="Volumen"
-        />
-      </div>
+      {!compact ? (
+        <div className="w-0 overflow-hidden group-hover/volume:w-24 transition-all duration-300 ease-out flex items-center ml-1">
+          <input
+            type="range"
+            min="0"
+            max="1"
+            step="0.05"
+            value={isMuted ? 0 : volume}
+            onChange={(e) => onVolumeChange(parseFloat(e.target.value))}
+            className="h-1 w-20 bg-white/30 rounded-lg appearance-none cursor-pointer accent-indigo-500 hover:accent-white"
+            aria-label="Volumen"
+          />
+        </div>
+      ) : null}
     </div>
   );
 };
@@ -307,34 +350,64 @@ const SettingsMenu: React.FC<{
   playbackRate: number;
   quality: string;
   showStats: boolean;
+  brightness: number;
+  contrast: number;
   onPlaybackRateChange: (rate: number) => void;
   onQualityChange: (quality: string) => void;
   onToggleStats: () => void;
+  onBrightnessChange: (val: number) => void;
+  onContrastChange: (val: number) => void;
   onClose: () => void;
-}> = ({ playbackRate, quality, showStats, onPlaybackRateChange, onQualityChange, onToggleStats, onClose }) => {
-  const [view, setView] = useState<'main' | 'speed'>('main');
+  compact?: boolean;
+}> = ({
+  playbackRate,
+  quality,
+  showStats,
+  brightness,
+  contrast,
+  onPlaybackRateChange,
+  onQualityChange,
+  onToggleStats,
+  onBrightnessChange,
+  onContrastChange,
+  onClose,
+  compact = false,
+}) => {
+  const [view, setView] = useState<'main' | 'speed' | 'display'>('main');
   const { t } = useI18n();
 
   return (
-    <div className="absolute bottom-full right-0 mb-4 w-72 bg-slate-950/95 backdrop-blur-xl border border-white/10 rounded-2xl overflow-hidden shadow-2xl animate-in zoom-in-95 duration-200 z-50">
+    <div className={`absolute bottom-full right-0 ${compact ? "mb-2 w-[min(88vw,20rem)]" : "mb-4 w-72"} bg-slate-950/95 backdrop-blur-xl border border-white/10 rounded-2xl overflow-hidden shadow-2xl animate-in zoom-in-95 duration-200 z-50`}>
       {view === 'main' ? (
         <div className="p-2">
           <button
             onClick={() => setView('speed')}
-            className="w-full flex items-center justify-between p-3 hover:bg-white/10 rounded-xl transition text-sm"
+            className="w-full flex items-center justify-between p-3 hover:bg-white/10 rounded-xl transition text-sm text-white"
           >
             <div className="flex items-center gap-3">
-              <Clock size={18} />
+              <Clock size={18} className="text-indigo-400" />
               <span>{t('player_speed')}</span>
             </div>
             <span className="text-indigo-400 font-bold">{playbackRate}x</span>
           </button>
+
           <button
-            onClick={onToggleStats}
-            className="w-full flex items-center justify-between p-3 hover:bg-white/10 rounded-xl transition text-sm"
+            onClick={() => setView('display')}
+            className="w-full flex items-center justify-between p-3 hover:bg-white/10 rounded-xl transition text-sm text-white"
           >
             <div className="flex items-center gap-3">
-              <Info size={18} />
+              <Settings size={18} className="text-indigo-400" />
+              <span>{t('display_settings') || 'Ajustes de Imagen'}</span>
+            </div>
+            <ChevronRight size={16} className="text-slate-500" />
+          </button>
+
+          <button
+            onClick={onToggleStats}
+            className="w-full flex items-center justify-between p-3 hover:bg-white/10 rounded-xl transition text-sm text-white"
+          >
+            <div className="flex items-center gap-3">
+              <Info size={18} className="text-indigo-400" />
               <span>{t('player_stats')}</span>
             </div>
             <div className={`w-8 h-4 rounded-full relative transition ${showStats ? 'bg-indigo-600' : 'bg-white/20'}`}>
@@ -378,6 +451,56 @@ const SettingsMenu: React.FC<{
         </div>
       ) : null}
 
+      {view === 'display' ? (
+        <div className="p-4 space-y-4">
+          <button
+            onClick={() => setView('main')}
+            className="w-full flex items-center gap-2 pb-2 border-b border-white/5 mb-2 text-slate-400 hover:text-white transition"
+          >
+            <ChevronLeft size={18} /> <span className="text-xs font-bold uppercase">{t('back')}</span>
+          </button>
+          
+          <div className="space-y-2">
+            <div className="flex justify-between text-xs text-slate-400 uppercase font-bold">
+              <span>{t('brightness') || 'Brillo'}</span>
+              <span className="text-indigo-400">{brightness}%</span>
+            </div>
+            <input
+              type="range"
+              min="50"
+              max="150"
+              value={brightness}
+              onChange={(e) => onBrightnessChange(parseInt(e.target.value))}
+              className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-indigo-500"
+            />
+          </div>
+
+          <div className="space-y-2">
+            <div className="flex justify-between text-xs text-slate-400 uppercase font-bold">
+              <span>{t('contrast') || 'Contraste'}</span>
+              <span className="text-indigo-400">{contrast}%</span>
+            </div>
+            <input
+              type="range"
+              min="50"
+              max="150"
+              value={contrast}
+              onChange={(e) => onContrastChange(parseInt(e.target.value))}
+              className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-indigo-500"
+            />
+          </div>
+
+          <button
+            onClick={() => {
+              onBrightnessChange(100);
+              onContrastChange(100);
+            }}
+            className="w-full py-2 text-xs font-bold text-indigo-400 hover:text-indigo-300 transition"
+          >
+            {t('reset_defaults') || 'Restablecer valores'}
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 };
@@ -396,8 +519,12 @@ const ControlButtons: React.FC<{
   onMuteToggle: () => void;
   playbackRate: number;
   quality: string;
+  brightness: number;
+  contrast: number;
   onPlaybackRateChange: (rate: number) => void;
   onQualityChange: (quality: string) => void;
+  onBrightnessChange: (val: number) => void;
+  onContrastChange: (val: number) => void;
   showSettings: boolean;
   onSettingsToggle: () => void;
   subtitlesAvailable: boolean;
@@ -412,6 +539,9 @@ const ControlButtons: React.FC<{
   onStatsToggle: () => void;
   isFullscreen: boolean;
   onFullscreenToggle: () => void;
+  isLocked: boolean;
+  onLockToggle: () => void;
+  compact?: boolean;
 }> = ({
   isPlaying,
   onPlayToggle,
@@ -426,8 +556,12 @@ const ControlButtons: React.FC<{
   onMuteToggle,
   playbackRate,
   quality,
+  brightness,
+  contrast,
   onPlaybackRateChange,
   onQualityChange,
+  onBrightnessChange,
+  onContrastChange,
   showSettings,
   onSettingsToggle,
   subtitlesAvailable,
@@ -442,134 +576,164 @@ const ControlButtons: React.FC<{
   onStatsToggle,
   isFullscreen,
   onFullscreenToggle,
+  isLocked,
+  onLockToggle,
+  compact = false,
 }) => {
   const { t } = useI18n();
   const rewindLabel = t('rewind_seconds').replace('{seconds}', String(SKIP_SECONDS));
   const forwardLabel = t('forward_seconds').replace('{seconds}', String(SKIP_SECONDS));
+  const iconSize = compact ? 20 : 22;
+  const navIconSize = compact ? 18 : 20;
+  const playSize = compact ? 30 : 32;
 
   return (
-  <div className="flex items-center justify-between">
-    <div className="flex items-center gap-4 md:gap-6">
-      <button
-        onClick={onPlayToggle}
-        className="text-white hover:text-indigo-400 transition-all hover:scale-110 active:scale-95"
-        aria-label={isPlaying ? t('pause') : t('play')}
-        title={isPlaying ? t('pause') : t('play')}
-      >
-        {isPlaying ? <Pause size={32} fill="currentColor" /> : <Play size={32} fill="currentColor" />}
-      </button>
+    <div className={`flex ${compact ? 'flex-col gap-2' : 'items-center justify-between'}`}>
+      <div className={`flex items-center ${compact ? 'w-full justify-between gap-2' : 'gap-4 md:gap-6'}`}>
+        {!compact ? (
+          <button
+            onClick={onLockToggle}
+            className={`p-2 transition rounded-full ${isLocked ? 'text-indigo-400 bg-white/10' : 'text-slate-300 hover:text-white hover:bg-white/10'}`}
+            aria-label={isLocked ? t('unlock') : t('lock')}
+            title={isLocked ? t('unlock') : t('lock')}
+          >
+            {isLocked ? <Lock size={20} /> : <Unlock size={20} />}
+          </button>
+        ) : null}
 
-      <div className="flex items-center gap-2">
-        {onPrevItem && (
-          <button
-            onClick={onPrevItem}
-            disabled={!hasPrevItem}
-            className="p-2 text-slate-400 hover:text-white disabled:opacity-30 transition hover:bg-white/10 rounded-full"
-            aria-label={t('previous_video')}
-            title={t('previous_video')}
-          >
-            <ChevronLeft size={20} />
-          </button>
-        )}
-        <button
-          onClick={() => onSkip(-SKIP_SECONDS)}
-          className="p-2 text-slate-300 hover:text-white transition hover:bg-white/10 rounded-full hover:rotate-[-10deg]"
-          aria-label={rewindLabel}
-          title={rewindLabel}
-        >
-          <SkipBack size={20} />
-        </button>
-        <button
-          onClick={() => onSkip(SKIP_SECONDS)}
-          className="p-2 text-slate-300 hover:text-white transition hover:bg-white/10 rounded-full hover:rotate-[10deg]"
-          aria-label={forwardLabel}
-          title={forwardLabel}
-        >
-          <SkipForward size={20} />
-        </button>
-        {onNextItem && (
-          <button
-            onClick={onNextItem}
-            disabled={!hasNextItem}
-            className="p-2 text-slate-400 hover:text-white disabled:opacity-30 transition hover:bg-white/10 rounded-full"
-            aria-label={t('next_video')}
-            title={t('next_video')}
-          >
-            <ChevronRight size={20} />
-          </button>
-        )}
+        {!isLocked ? (
+          <>
+            <button
+              onClick={onPlayToggle}
+              className="text-white hover:text-indigo-400 transition-all hover:scale-110 active:scale-95"
+              aria-label={isPlaying ? t('pause') : t('play')}
+              title={isPlaying ? t('pause') : t('play')}
+            >
+              {isPlaying ? <Pause size={playSize} fill="currentColor" /> : <Play size={playSize} fill="currentColor" />}
+            </button>
+
+            <div className={`flex items-center ${compact ? 'gap-1.5' : 'gap-2'}`}>
+              {!compact && onPrevItem ? (
+                <button
+                  onClick={onPrevItem}
+                  disabled={!hasPrevItem}
+                  className="p-2 text-slate-400 hover:text-white disabled:opacity-30 transition hover:bg-white/10 rounded-full"
+                  aria-label={t('previous_video')}
+                  title={t('previous_video')}
+                >
+                  <ChevronLeft size={navIconSize} />
+                </button>
+              ) : null}
+              <button
+                onClick={() => onSkip(-SKIP_SECONDS)}
+                className="p-2 text-slate-300 hover:text-white transition hover:bg-white/10 rounded-full"
+                aria-label={rewindLabel}
+                title={rewindLabel}
+              >
+                <SkipBack size={navIconSize} />
+              </button>
+              <button
+                onClick={() => onSkip(SKIP_SECONDS)}
+                className="p-2 text-slate-300 hover:text-white transition hover:bg-white/10 rounded-full"
+                aria-label={forwardLabel}
+                title={forwardLabel}
+              >
+                <SkipForward size={navIconSize} />
+              </button>
+              {!compact && onNextItem ? (
+                <button
+                  onClick={onNextItem}
+                  disabled={!hasNextItem}
+                  className="p-2 text-slate-400 hover:text-white disabled:opacity-30 transition hover:bg-white/10 rounded-full"
+                  aria-label={t('next_video')}
+                  title={t('next_video')}
+                >
+                  <ChevronRight size={navIconSize} />
+                </button>
+              ) : null}
+            </div>
+
+            <VolumeControl volume={volume} isMuted={isMuted} onVolumeChange={onVolumeChange} onMuteToggle={onMuteToggle} compact={compact} />
+          </>
+        ) : null}
       </div>
 
-      <VolumeControl volume={volume} isMuted={isMuted} onVolumeChange={onVolumeChange} onMuteToggle={onMuteToggle} />
+      {!isLocked ? (
+        <div className={`flex items-center ${compact ? 'w-full justify-between gap-1.5' : 'gap-3'}`}>
+          <button
+            onClick={onSubtitlesToggle}
+            disabled={!subtitlesAvailable}
+            className={`p-2 transition rounded-full ${
+              subtitlesAvailable ? 'hover:bg-white/10' : 'opacity-40 cursor-not-allowed'
+            } ${subtitlesEnabled ? 'text-white bg-white/10' : 'text-slate-300 hover:text-white'}`}
+            aria-label={t('subtitles')}
+            title={t('subtitles')}
+          >
+            <Subtitles size={iconSize} />
+          </button>
+
+          <button
+            onClick={onEpisodesToggle}
+            disabled={!episodesAvailable}
+            className={`p-2 transition rounded-full ${
+              episodesAvailable ? 'hover:bg-white/10' : 'opacity-40 cursor-not-allowed'
+            } ${episodesOpen ? 'text-white bg-white/10' : 'text-slate-300 hover:text-white'}`}
+            aria-label={t('episodes')}
+            title={t('episodes_shortcut')}
+          >
+            <List size={iconSize} />
+          </button>
+
+          {!compact ? (
+            <button
+              onClick={onPipToggle}
+              className={`p-2 transition rounded-full hover:bg-white/10 ${isPip ? 'text-white bg-white/10' : 'text-slate-300 hover:text-white'}`}
+              aria-label={t('pip')}
+              title={t('pip')}
+            >
+              <PictureInPicture size={iconSize} />
+            </button>
+          ) : null}
+
+          <div className="relative">
+            {showSettings ? (
+              <SettingsMenu
+                playbackRate={playbackRate}
+                quality={quality}
+                showStats={showStats}
+                brightness={brightness}
+                contrast={contrast}
+                onPlaybackRateChange={onPlaybackRateChange}
+                onQualityChange={onQualityChange}
+                onToggleStats={onStatsToggle}
+                onBrightnessChange={onBrightnessChange}
+                onContrastChange={onContrastChange}
+                onClose={onSettingsToggle}
+                compact={compact}
+              />
+            ) : null}
+            <button
+              onClick={onSettingsToggle}
+              className={`p-2 transition rounded-full hover:bg-white/10 ${showSettings ? 'text-white bg-white/10 rotate-45' : 'text-slate-300'}`}
+              aria-label={t('settings')}
+              title={t('settings')}
+              aria-pressed={showSettings}
+            >
+              <Settings size={iconSize} />
+            </button>
+          </div>
+
+          <button
+            onClick={onFullscreenToggle}
+            className="p-2 text-slate-300 hover:text-white transition hover:bg-white/10 rounded-full"
+            aria-label={isFullscreen ? t('exit_fullscreen') : t('fullscreen')}
+            title={isFullscreen ? t('exit_fullscreen') : t('fullscreen')}
+          >
+            {isFullscreen ? <Minimize size={iconSize} /> : <Maximize size={iconSize} />}
+          </button>
+        </div>
+      ) : null}
     </div>
-
-    <div className="flex items-center gap-3">
-      <button
-        onClick={onSubtitlesToggle}
-        disabled={!subtitlesAvailable}
-        className={`p-2 transition rounded-full ${
-          subtitlesAvailable ? 'hover:bg-white/10' : 'opacity-40 cursor-not-allowed'
-        } ${subtitlesEnabled ? 'text-white bg-white/10' : 'text-slate-300 hover:text-white'}`}
-        aria-label={t('subtitles')}
-        title={t('subtitles')}
-      >
-        <Subtitles size={22} />
-      </button>
-
-      <button
-        onClick={onEpisodesToggle}
-        disabled={!episodesAvailable}
-        className={`p-2 transition rounded-full ${
-          episodesAvailable ? 'hover:bg-white/10' : 'opacity-40 cursor-not-allowed'
-        } ${episodesOpen ? 'text-white bg-white/10' : 'text-slate-300 hover:text-white'}`}
-        aria-label={t('episodes')}
-        title={t('episodes_shortcut')}
-      >
-        <List size={22} />
-      </button>
-
-      <button
-        onClick={onPipToggle}
-        className={`p-2 transition rounded-full hover:bg-white/10 ${isPip ? 'text-white bg-white/10' : 'text-slate-300 hover:text-white'}`}
-        aria-label={t('pip')}
-        title={t('pip')}
-      >
-        <PictureInPicture size={22} />
-      </button>
-
-      <div className="relative">
-        {showSettings && (
-          <SettingsMenu
-            playbackRate={playbackRate}
-            quality={quality}
-            showStats={showStats}
-            onPlaybackRateChange={onPlaybackRateChange}
-            onQualityChange={onQualityChange}
-            onToggleStats={onStatsToggle}
-            onClose={onSettingsToggle}
-          />
-        )}
-        <button
-          onClick={onSettingsToggle}
-          className={`p-2 transition rounded-full hover:bg-white/10 ${showSettings ? 'text-white bg-white/10 rotate-45' : 'text-slate-300'}`}
-        aria-label={t('settings')}
-        title={t('settings')}
-          aria-pressed={showSettings}
-        >
-          <Settings size={22} />
-        </button>
-      </div>
-
-      <button
-        onClick={onFullscreenToggle}
-        className="p-2 text-slate-300 hover:text-white transition hover:bg-white/10 rounded-full"
-        aria-label={isFullscreen ? t('exit_fullscreen') : t('fullscreen')}
-        title={isFullscreen ? t('exit_fullscreen') : t('fullscreen')}
-      >
-        {isFullscreen ? <Minimize size={22} /> : <Maximize size={22} />}
-      </button>
-    </div>
-  </div>
   );
 };
 
@@ -591,6 +755,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   subtitlesUrl,
   autoPlay = true,
   startTime,
+  onProgressUpdate,
 }) => {
   const { t } = useI18n();
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -600,11 +765,21 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const mouseMoveTimeoutRef = useRef<number | null>(null);
   const clickTimerRef = useRef<number | null>(null);
   const startTimeAppliedRef = useRef(false);
+  const lastProgressEmitRef = useRef<number>(0);
   const subtitlesTrackRef = useRef<HTMLTrackElement>(null);
   const userCollapsedAllSeasonsRef = useRef(false);
   const [showContinueOverlay, setShowContinueOverlay] = useState(false);
   const [openSeasonKey, setOpenSeasonKey] = useState<string | null>(null);
   const [episodesPanelOpen, setEpisodesPanelOpen] = useState(false);
+  const [brightness, setBrightness] = useState(100);
+  const [contrast, setContrast] = useState(100);
+  const [isCompact, setIsCompact] = useState<boolean>(() => {
+    try {
+      return typeof window !== 'undefined' ? (window.innerWidth < 900 || window.innerHeight < 620) : false;
+    } catch {
+      return false;
+    }
+  });
 
   const [state, dispatch] = useReducer(playerReducer, null, () => {
     const storedVol = getStoredPreference('volume', 0.8);
@@ -645,6 +820,23 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       dispatch({ type: 'SET_FEEDBACK', payload: null });
     }, FEEDBACK_DURATION);
   }, []);
+
+  const emitProgress = useCallback(
+    (force = false, ended = false) => {
+      if (!onProgressUpdate) return;
+      const v = videoRef.current;
+      if (!v) return;
+      const dur = v.duration;
+      if (!Number.isFinite(dur) || dur <= 0) return;
+      const current = v.currentTime;
+      const progress = (current / dur) * 100;
+      const now = Date.now();
+      if (!force && now - lastProgressEmitRef.current < 5000) return;
+      lastProgressEmitRef.current = now;
+      onProgressUpdate({ current, duration: dur, progress, force, ended });
+    },
+    [onProgressUpdate],
+  );
 
   const handleClose = useCallback(() => {
     try {
@@ -812,6 +1004,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   }, []);
 
   const handleEnded = useCallback(() => {
+    emitProgress(true, true);
     dispatch({ type: 'SET_PLAYING', payload: false });
     dispatch({ type: 'SET_SHOW_CONTROLS', payload: true });
     if (onNextItem && hasNextItem !== false) {
@@ -833,7 +1026,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     if (onContinueNextSeries && nextSeriesTitle) {
       setShowContinueOverlay(true);
     }
-  }, [onNextItem, hasNextItem, t, triggerFeedback, onContinueNextSeries, nextSeriesTitle]);
+  }, [emitProgress, onNextItem, hasNextItem, t, triggerFeedback, onContinueNextSeries, nextSeriesTitle]);
 
   const handleTimeUpdate = useCallback(() => {
     const v = videoRef.current;
@@ -859,8 +1052,13 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       // ignore
     }
 
+    if (state.isBuffering && !v.paused && v.readyState >= 2) {
+      dispatch({ type: 'SET_BUFFERING', payload: false });
+    }
+
     dispatch({ type: 'SET_TIME', payload: { current, duration: dur, progress: newProgress, buffered: newBuffered } });
-  }, [state.buffered]);
+    emitProgress(false, false);
+  }, [emitProgress, state.buffered, state.isBuffering]);
 
   const applySubtitlesMode = useCallback(
     (enabled: boolean) => {
@@ -886,6 +1084,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         dispatch({ type: 'TOGGLE_LOCK' });
         return;
       }
+
+      if (state.isLocked) return;
 
       switch (e.key) {
         case 'Escape':
@@ -1108,7 +1308,21 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       if (feedbackTimeoutRef.current) window.clearTimeout(feedbackTimeoutRef.current);
       if (mouseMoveTimeoutRef.current) window.clearTimeout(mouseMoveTimeoutRef.current);
       if (clickTimerRef.current) window.clearTimeout(clickTimerRef.current);
+      emitProgress(true, false);
     };
+  }, [emitProgress]);
+
+  useEffect(() => {
+    const recomputeCompact = () => {
+      try {
+        setIsCompact(window.innerWidth < 900 || window.innerHeight < 620);
+      } catch {
+        // ignore
+      }
+    };
+    recomputeCompact();
+    window.addEventListener('resize', recomputeCompact);
+    return () => window.removeEventListener('resize', recomputeCompact);
   }, []);
 
   useEffect(() => {
@@ -1128,7 +1342,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         if (state.isPlaying && !state.showSettings) dispatch({ type: 'SET_SHOW_CONTROLS', payload: false });
       }}
       onClick={handleContainerClick}
-      className={`fixed inset-0 z-[200] w-screen h-screen bg-black flex flex-col justify-center overflow-hidden font-sans select-none group/player text-white ${
+      className={`fixed inset-0 z-[200] w-screen h-screen bg-[#05070c] flex flex-col justify-center overflow-hidden font-sans select-none group/player text-white ${
         state.isIdle ? 'cursor-none' : 'cursor-default'
       }`}
       role="region"
@@ -1139,9 +1353,14 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         src={src}
         poster={poster}
         playsInline
-        className="w-full h-full object-contain bg-black"
+        preload="metadata"
+        className="w-full h-full object-contain bg-[#05070c] transition-all duration-300"
+        style={{
+          filter: `brightness(${brightness}%) contrast(${contrast}%)`
+        }}
         onTimeUpdate={handleTimeUpdate}
         onProgress={handleTimeUpdate}
+        onLoadStart={() => dispatch({ type: 'SET_BUFFERING', payload: true })}
         onLoadedMetadata={() => {
           const v = videoRef.current;
           if (!v) return;
@@ -1174,10 +1393,14 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
           dispatch({ type: 'SET_BUFFERING', payload: false });
           dispatch({ type: 'SET_ERROR', payload: null });
         }}
-        onPause={() => dispatch({ type: 'SET_PLAYING', payload: false })}
+        onPause={() => {
+          dispatch({ type: 'SET_PLAYING', payload: false });
+          emitProgress(true, false);
+        }}
         onWaiting={() => dispatch({ type: 'SET_BUFFERING', payload: true })}
         onCanPlay={() => dispatch({ type: 'SET_BUFFERING', payload: false })}
         onPlaying={() => dispatch({ type: 'SET_BUFFERING', payload: false })}
+        onStalled={() => dispatch({ type: 'SET_BUFFERING', payload: true })}
         onEnded={handleEnded}
         onError={() => {
           dispatch({ type: 'SET_PLAYING', payload: false });
@@ -1204,7 +1427,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         aria-hidden="true"
       />
       <div
-        className={`absolute bottom-0 left-0 right-0 h-48 bg-gradient-to-t from-black/90 via-black/50 to-transparent pointer-events-none transition-opacity duration-500 ${
+        className={`absolute bottom-0 left-0 right-0 h-32 sm:h-48 bg-gradient-to-t from-black/90 via-black/50 to-transparent pointer-events-none transition-opacity duration-500 ${
           state.showControls ? 'opacity-100' : 'opacity-0'
         }`}
         aria-hidden="true"
@@ -1274,7 +1497,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       ) : null}
 
       {state.showStats ? (
-        <div className="absolute top-20 left-6 z-[55] bg-black/60 backdrop-blur-md p-4 rounded-2xl border border-white/10 text-[10px] font-mono text-indigo-300 pointer-events-none">
+        <div className={`absolute ${isCompact ? 'top-14 left-3 text-[9px] p-2.5 rounded-xl' : 'top-20 left-6 text-[10px] p-4 rounded-2xl'} z-[55] bg-black/60 backdrop-blur-md border border-white/10 font-mono text-indigo-300 pointer-events-none`}>
           <div>{t('stats_resolution')}: {videoRef.current?.videoWidth}x{videoRef.current?.videoHeight}</div>
           <div>{t('stats_speed')}: {state.playbackRate}x</div>
           <div>{t('stats_buffer')}: {Math.round(state.buffered)}%</div>
@@ -1291,9 +1514,9 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         </div>
       )}
 
-      <div className={`absolute top-0 left-0 right-0 p-6 flex justify-between items-start z-50 transition-transform duration-300 ${state.showControls ? 'translate-y-0' : '-translate-y-20'}`}>
+      <div className={`absolute top-0 left-0 right-0 ${isCompact ? 'p-3' : 'p-6'} flex justify-between items-start z-50 transition-transform duration-300 ${state.showControls ? 'translate-y-0' : '-translate-y-20'}`}>
         <div className="flex flex-col min-w-0">
-          <h1 className="text-xl md:text-2xl font-bold text-white tracking-tight truncate">{title}</h1>
+          <h1 className={`font-bold text-white tracking-tight truncate ${isCompact ? 'text-base' : 'text-xl md:text-2xl'}`}>{title}</h1>
           {nowPlayingLabel && <span className="text-xs text-indigo-300 font-medium tracking-wider uppercase mt-1 truncate" title={nowPlayingLabel}>{nowPlayingLabel}</span>}
         </div>
         <button
@@ -1301,19 +1524,20 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
             e.stopPropagation();
             handleClose();
           }}
-          className="group p-2 rounded-full bg-black/20 hover:bg-white/20 backdrop-blur-md border border-white/5 transition-all hover:scale-105"
+          className={`group ${isCompact ? 'p-1.5' : 'p-2'} rounded-full bg-black/20 hover:bg-white/20 backdrop-blur-md border border-white/5 transition-all hover:scale-105`}
           aria-label={t('close_player')}
           title={t('close')}
         >
-          <X size={24} className="text-slate-200 group-hover:text-white" />
+          <X size={isCompact ? 20 : 24} className="text-slate-200 group-hover:text-white" />
         </button>
       </div>
 
       <div
-        className={`absolute bottom-0 left-0 right-0 px-6 pb-6 pt-12 z-50 transition-all duration-300 ${
+        className={`absolute bottom-0 left-0 right-0 ${isCompact ? 'px-3 pb-3 pt-7' : 'px-6 pb-6 pt-12'} z-50 transition-all duration-300 ${
           state.showControls ? 'translate-y-0 opacity-100' : 'translate-y-10 opacity-0 pointer-events-none'
         }`}
         onClick={(e) => e.stopPropagation()}
+        style={isCompact ? { paddingBottom: 'calc(0.75rem + env(safe-area-inset-bottom))' } : undefined}
       >
         {state.isLocked ? (
           <div className="mb-3 flex justify-center">
@@ -1325,7 +1549,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
 
         <div className={state.isLocked ? 'pointer-events-none opacity-30 grayscale' : ''}>
         {episodesPanelOpen && Array.isArray(episodeSeasons) && episodeSeasons.length > 0 ? (
-          <div className={`absolute right-6 bottom-28 w-72 max-h-[52vh] bg-slate-950/90 border border-white/10 rounded-2xl backdrop-blur-xl shadow-2xl overflow-hidden transition-opacity ${
+          <div className={`absolute ${isCompact ? 'left-3 right-3 bottom-24 w-auto max-h-[56vh]' : 'right-6 bottom-28 w-72 max-h-[52vh]'} bg-slate-950/90 border border-white/10 rounded-2xl backdrop-blur-xl shadow-2xl overflow-hidden transition-opacity ${
             state.showControls ? 'opacity-100' : 'opacity-0 pointer-events-none'
           }`}>
             <div className="px-3 py-2 border-b border-white/10 flex items-center justify-between">
@@ -1357,7 +1581,10 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
                     {open ? (
                       <div className="pb-2">
                         {season.episodes.map((f: any, idx: number) => {
-                          const ep = (typeof f?.index === 'number' ? f.index : (typeof f?.file_index === 'number' ? f.file_index : idx + 1)) as number;
+                          let ep = (typeof f?.index === 'number' ? f.index : (typeof f?.file_index === 'number' ? f.file_index : idx + 1)) as number;
+                          if (Number.isFinite(ep) && ep >= 1000) {
+                            ep = ep % 1000;
+                          }
                           const title =
                             f?.episodeTitle ||
                             f?.title ||
@@ -1395,6 +1622,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
           currentTime={state.currentTime}
           duration={state.duration}
           onSeek={handleSeek}
+          compact={isCompact}
         />
 
         <ControlButtons
@@ -1411,8 +1639,12 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
           onMuteToggle={toggleMute}
           playbackRate={state.playbackRate}
           quality={state.quality}
+          brightness={brightness}
+          contrast={contrast}
           onPlaybackRateChange={handlePlaybackRateChange}
           onQualityChange={handleQualityChange}
+          onBrightnessChange={setBrightness}
+          onContrastChange={setContrast}
           showSettings={state.showSettings}
           onSettingsToggle={() => dispatch({ type: 'TOGGLE_SETTINGS' })}
           subtitlesAvailable={!!subtitlesUrl}
@@ -1435,6 +1667,9 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
           onStatsToggle={() => dispatch({ type: 'TOGGLE_STATS' })}
           isFullscreen={state.isFullscreen}
           onFullscreenToggle={toggleFullscreen}
+          isLocked={state.isLocked}
+          onLockToggle={() => dispatch({ type: 'TOGGLE_LOCK' })}
+          compact={isCompact}
         />
         </div>
       </div>
@@ -1444,13 +1679,13 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
           e.stopPropagation();
           dispatch({ type: 'TOGGLE_LOCK' });
         }}
-        className={`absolute left-6 top-1/2 -translate-y-1/2 p-4 rounded-2xl bg-black/40 backdrop-blur-xl border border-white/10 transition-all duration-300 z-[55] ${
-          state.showControls ? 'translate-x-0 opacity-100' : '-translate-x-16 opacity-0'
+        className={`absolute ${isCompact ? 'right-3 bottom-24 p-3 rounded-xl' : 'left-6 top-1/2 -translate-y-1/2 p-4 rounded-2xl'} bg-black/40 backdrop-blur-xl border border-white/10 transition-all duration-300 z-[55] ${
+          state.showControls ? (isCompact ? 'translate-y-0 opacity-100' : 'translate-x-0 opacity-100') : (isCompact ? 'translate-y-8 opacity-0' : '-translate-x-16 opacity-0')
         }`}
         aria-label={state.isLocked ? t('unlock_controls') : t('lock_controls')}
         title={state.isLocked ? t('unlock_controls_hint') : t('lock_controls_hint')}
       >
-        {state.isLocked ? <Lock className="text-indigo-400" size={24} /> : <Unlock className="text-white/60" size={24} />}
+        {state.isLocked ? <Lock className="text-indigo-400" size={isCompact ? 20 : 24} /> : <Unlock className="text-white/60" size={isCompact ? 20 : 24} />}
       </button>
     </div>
   );

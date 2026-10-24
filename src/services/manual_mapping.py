@@ -4,6 +4,7 @@ import datetime
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -11,12 +12,55 @@ import requests
 
 from ..core.config import get as get_config
 from ..core.config import DATA_DIR
-from ..db import models
+from ..db import models, SessionLocal
 
 logger = logging.getLogger(__name__)
 
 TMDB_BASE = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/"
+
+try:
+    from ..providers import provider_jikan as jikan
+except Exception:
+    try:
+        from src.providers import provider_jikan as jikan  # type: ignore
+    except Exception:
+        jikan = None
+try:
+    from ..providers import provider_kitsu as kitsu
+except Exception:
+    try:
+        from src.providers import provider_kitsu as kitsu  # type: ignore
+    except Exception:
+        kitsu = None
+
+
+def _is_anime_context_for_manual_mapping(db, mi: Any) -> bool:
+    """Allow Jikan/Kitsu only for anime-like items (safety guard).
+
+    Prevents accidentally applying anime providers to movie/series libraries.
+    """
+    if not mi:
+        return False
+    try:
+        if str(getattr(mi, "library_type", "") or "").strip().lower() == "anime":
+            return True
+    except Exception:
+        pass
+    try:
+        root_path = getattr(mi, "media_root", None)
+        if root_path:
+            mr = db.query(models.MediaRoot).filter(models.MediaRoot.path == str(root_path)).first()
+            if mr and str(getattr(mr, "type", "") or "").strip().lower() == "anime":
+                return True
+    except Exception:
+        pass
+    try:
+        if getattr(mi, "mal_id", None):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _guess_ext(url: str, content_type: str | None = None) -> str:
@@ -51,6 +95,146 @@ def _download_to(url: str, target_path: Path) -> Path | None:
     except Exception as e:
         logger.warning("Failed downloading asset %s: %s", url, e)
         return None
+
+
+def _is_remote_asset_url(value: str | None) -> bool:
+    try:
+        v = str(value or "").strip().lower()
+        return v.startswith("http://") or v.startswith("https://")
+    except Exception:
+        return False
+
+
+def _is_current_manual_asset_url(media_item_id: int, value: str | None) -> bool:
+    try:
+        v = str(value or "").strip()
+        return bool(v and v.startswith(f"/media-assets/{int(media_item_id)}/"))
+    except Exception:
+        return False
+
+
+def _cleanup_manual_asset_dir(
+    media_item_id: int,
+    *,
+    remove_poster: bool = True,
+    remove_backdrop: bool = True,
+) -> Path:
+    base_dir = Path(DATA_DIR) / "assets" / str(media_item_id)
+    if base_dir.exists():
+        try:
+            for item in base_dir.iterdir():
+                if not item.is_file():
+                    continue
+                stem = str(item.stem or "").strip().lower()
+                should_remove = (
+                    (remove_poster and stem.startswith("poster"))
+                    or (remove_backdrop and stem.startswith("backdrop"))
+                )
+                if should_remove:
+                    item.unlink()
+        except Exception as e:
+            logger.warning("Failed cleaning up existing assets in %s: %s", base_dir, e)
+    return base_dir
+
+
+def _clear_manual_provider_rows(db, media_item_id: int) -> None:
+    try:
+        db.query(models.MediaMetadata).filter(models.MediaMetadata.media_item_id == int(media_item_id)).delete(synchronize_session=False)
+    except Exception:
+        pass
+    try:
+        db.query(models.MediaImage).filter(models.MediaImage.media_item_id == int(media_item_id)).delete(synchronize_session=False)
+    except Exception:
+        pass
+
+
+def _reset_media_item_manual_state(
+    mi: Any,
+    *,
+    clear_artwork: bool = False,
+    clear_descriptive: bool = False,
+) -> None:
+    # Provider identity and provider-derived fields must not survive a new manual mapping.
+    for attr in (
+        "provider",
+        "provider_id",
+        "tmdb_id",
+        "mal_id",
+        "jikan_type",
+        "jikan_anchor_mal_id",
+        "title_en",
+        "release_year",
+        "runtime",
+        "cast",
+        "rating",
+        "content_rating",
+        "origin",
+        "is_animated",
+    ):
+        try:
+            setattr(mi, attr, None)
+        except Exception:
+            pass
+    if clear_artwork:
+        for attr in ("poster_path", "backdrop_path"):
+            try:
+                setattr(mi, attr, None)
+            except Exception:
+                pass
+    if clear_descriptive:
+        for attr in ("genres",):
+            try:
+                setattr(mi, attr, None)
+            except Exception:
+                pass
+
+
+def _normalize_episodes_for_item(media_item_id: int) -> bool:
+    """Best-effort: rebuild normalized Episode/EpisodeFile rows for a media item.
+
+    Uses existing FileRecord rows; no external API calls.
+    """
+    try:
+        from ..scanner.scanner import Scanner
+    except Exception:
+        return False
+
+    session = SessionLocal()
+    try:
+        mi = session.query(models.MediaItem).filter(models.MediaItem.id == int(media_item_id)).first()
+        if not mi:
+            return False
+        files = session.query(models.FileRecord).filter(models.FileRecord.media_item_id == int(media_item_id)).all()
+        media_files = [str(getattr(f, "path", "") or "") for f in files if getattr(f, "path", None)]
+        if not media_files:
+            return False
+        folder = str(getattr(mi, "canonical_path", "") or "").strip()
+        if not folder:
+            try:
+                folder = str(Path(media_files[0]).parent)
+            except Exception:
+                folder = ""
+        if not folder:
+            return False
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+    try:
+        scanner = Scanner(discovery_only=False)
+        scanner._upsert_folder(
+            folder,
+            media_files,
+            skip_grouping=True,
+            canonical_path_override=folder,
+            discovery_only_override=False,
+        )
+        return True
+    except Exception as e:
+        logger.exception("Manual mapping normalization failed for media_item=%s: %s", media_item_id, e)
+        return False
 
 
 def _get_tmdb_api_key() -> str:
@@ -205,6 +389,434 @@ def tmdb_season_details(tmdb_id: str, *, season_number: int, language: str) -> d
     }
 
 
+def _jikan_media_type(obj: dict | None) -> str:
+    try:
+        t = str((obj or {}).get("type") or "").strip().lower()
+    except Exception:
+        t = ""
+    if "movie" in t:
+        return "movie"
+    return "tv"
+
+
+def _jikan_poster(obj: dict | None) -> str | None:
+    try:
+        images = (obj or {}).get("images") or {}
+        jpg = images.get("jpg") or {}
+        return jpg.get("large_image_url") or jpg.get("image_url")
+    except Exception:
+        return None
+
+
+def _normalize_jikan_candidate(obj: dict) -> dict:
+    poster = _jikan_poster(obj)
+    title = obj.get("title_english") or obj.get("title") or obj.get("title_japanese") or ""
+    year = obj.get("year") or ""
+    return {
+        "mal_id": obj.get("mal_id"),
+        "media_type": _jikan_media_type(obj),
+        "title": title,
+        "year": str(year) if year is not None else "",
+        "poster": poster,
+    }
+
+
+def _kitsu_pick_title(attrs: dict | None) -> str:
+    a = attrs or {}
+    try:
+        ct = a.get("canonicalTitle")
+        if isinstance(ct, str) and ct.strip():
+            return ct.strip()
+    except Exception:
+        pass
+    titles = a.get("titles") if isinstance(a.get("titles"), dict) else {}
+    for k in ("en", "en_us", "en_jp", "es", "es_mx", "es_es", "ja_jp"):
+        try:
+            v = titles.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        except Exception:
+            continue
+    try:
+        v = titles.get("en") or titles.get("en_jp")
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _kitsu_poster(attrs: dict | None) -> str | None:
+    a = attrs or {}
+    try:
+        pi = a.get("posterImage")
+        if isinstance(pi, dict):
+            return pi.get("original") or pi.get("large") or pi.get("medium") or pi.get("small")
+    except Exception:
+        pass
+    return None
+
+
+def _kitsu_cover(attrs: dict | None) -> str | None:
+    a = attrs or {}
+    try:
+        ci = a.get("coverImage")
+        if isinstance(ci, dict):
+            return ci.get("original") or ci.get("large") or ci.get("medium") or ci.get("small")
+    except Exception:
+        pass
+    return None
+
+
+def _normalize_kitsu_candidate(obj: dict) -> dict:
+    try:
+        attrs = obj.get("attributes") if isinstance(obj.get("attributes"), dict) else {}
+    except Exception:
+        attrs = {}
+    title = _kitsu_pick_title(attrs)
+    poster = _kitsu_poster(attrs)
+    year = ""
+    try:
+        sd = attrs.get("startDate")
+        if isinstance(sd, str) and len(sd) >= 4:
+            year = sd[:4]
+    except Exception:
+        year = ""
+    return {
+        "kitsu_id": obj.get("id"),
+        "media_type": "tv",
+        "title": title,
+        "year": year,
+        "poster": poster,
+    }
+
+
+def kitsu_search(query: str) -> dict:
+    if not kitsu:
+        raise RuntimeError("kitsu_unavailable")
+    q = str(query or "").strip()
+    if not q:
+        return {"ok": True, "results": []}
+    try:
+        rows = kitsu.search(q) if hasattr(kitsu, "search") else []
+        out = [_normalize_kitsu_candidate(r) for r in rows if isinstance(r, dict)]
+        return {"ok": True, "results": out}
+    except Exception as e:
+        logger.exception("Kitsu manual search failed for %s: %s", q, e)
+        raise
+
+
+def kitsu_details(kitsu_id: str) -> dict:
+    if not kitsu:
+        raise RuntimeError("kitsu_unavailable")
+    kid = str(kitsu_id or "").strip()
+    if not kid:
+        return {"ok": False, "detail": "kitsu_id_missing"}
+    try:
+        res = kitsu.fetch_by_id(kid) if hasattr(kitsu, "fetch_by_id") else None
+    except Exception as e:
+        logger.exception("Kitsu manual details failed for kitsu_id=%s: %s", kid, e)
+        raise
+    if not isinstance(res, dict):
+        return {"ok": False, "detail": "not_found"}
+    try:
+        data = res.get("data") if isinstance(res.get("data"), dict) else None
+    except Exception:
+        data = None
+    if not isinstance(data, dict):
+        return {"ok": False, "detail": "not_found"}
+    attrs = data.get("attributes") if isinstance(data.get("attributes"), dict) else {}
+    title = _kitsu_pick_title(attrs)
+    overview = ""
+    try:
+        syn = attrs.get("synopsis")
+        overview = kitsu.clean_synopsis_text(syn) if isinstance(syn, str) and syn.strip() else ""
+    except Exception:
+        overview = ""
+    poster = _kitsu_poster(attrs)
+    cover = _kitsu_cover(attrs)
+    posters = [poster] if poster else []
+    backdrops = [cover] if cover else []
+    year = ""
+    try:
+        sd = attrs.get("startDate")
+        if isinstance(sd, str) and len(sd) >= 4:
+            year = sd[:4]
+    except Exception:
+        year = ""
+    return {
+        "ok": True,
+        "kitsu_id": kid,
+        "media_type": "tv",
+        "title": title,
+        "overview": overview,
+        "genres": [],
+        "poster": poster,
+        "posters": posters,
+        "backdrops": backdrops,
+        "year": year,
+    }
+
+
+def jikan_search(query: str) -> dict:
+    if not jikan:
+        raise RuntimeError("jikan_unavailable")
+    q = str(query or "").strip()
+    if not q:
+        return {"ok": True, "results": []}
+    try:
+        results = []
+        if hasattr(jikan, "buscar_anime_candidates"):
+            results = jikan.buscar_anime_candidates(q) or []
+        elif hasattr(jikan, "search"):
+            one = jikan.search(q)
+            results = [one] if one else []
+        out = [_normalize_jikan_candidate(r) for r in results if isinstance(r, dict)]
+        return {"ok": True, "results": out}
+    except Exception as e:
+        logger.exception("Jikan manual search failed for %s: %s", q, e)
+        raise
+
+
+def jikan_details(mal_id: str) -> dict:
+    if not jikan:
+        raise RuntimeError("jikan_unavailable")
+    mid = str(mal_id or "").strip()
+    if not mid:
+        return {"ok": False, "detail": "invalid_mal_id"}
+    res = None
+    try:
+        if hasattr(jikan, "fetch_by_id"):
+            res = jikan.fetch_by_id(mid)
+    except Exception as e:
+        logger.exception("Jikan details failed for %s: %s", mid, e)
+        raise
+    if not res:
+        return {"ok": False, "detail": "not_found"}
+    poster = _jikan_poster(res)
+    genres = []
+    for g in (res.get("genres") or []):
+        try:
+            name = g.get("name") if isinstance(g, dict) else str(g)
+            if name:
+                genres.append(name)
+        except Exception:
+            continue
+    title = res.get("title_english") or res.get("title") or res.get("title_japanese") or ""
+    overview = res.get("synopsis") or ""
+    return {
+        "ok": True,
+        "mal_id": mid,
+        "media_type": _jikan_media_type(res),
+        "title": title,
+        "overview": overview,
+        "genres": genres,
+        "poster": poster,
+        "posters": [poster] if poster else [],
+        "backdrops": [],
+        "year": str(res.get("year") or "") if res.get("year") is not None else "",
+    }
+
+
+def apply_manual_mapping_jikan(
+    *,
+    db,
+    media_item_id: int,
+    mal_id: str,
+    fetch_episodes: bool = False,
+) -> dict:
+    mi = db.query(models.MediaItem).filter(models.MediaItem.id == media_item_id).first()
+    if not mi:
+        return {"ok": False, "detail": "media_item_not_found"}
+    try:
+        if not _is_anime_context_for_manual_mapping(db, mi):
+            logger.warning(
+                "Manual Jikan mapping on non-anime context media_item=%s (explicit override)",
+                media_item_id,
+            )
+    except Exception:
+        pass
+    try:
+        mi_any = cast(Any, mi)
+        _clear_manual_provider_rows(db, int(media_item_id))
+        _reset_media_item_manual_state(mi_any, clear_artwork=True, clear_descriptive=True)
+        mi_any.provider = "jikan"
+        mi_any.mal_id = str(mal_id).strip()
+        try:
+            if mi_any.status in ("NO_MATCH", "ERROR", "MANUAL"):
+                mi_any.status = None
+        except Exception:
+            pass
+        db.add(mi_any)
+        db.commit()
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        logger.exception("Manual Jikan mapping commit failed for media_item=%s: %s", media_item_id, e)
+        return {"ok": False, "detail": "db_commit_failed", "error": str(e)}
+    try:
+        from . import enrichment_runner
+        # Use config override if fetch_episodes is True (best-effort).
+        # Note: packaged builds might temporarily lag behind and miss this helper.
+        set_temp_override = None
+        if fetch_episodes:
+            try:
+                from ..core.config import set_temp_override as _set_temp_override  # type: ignore
+                set_temp_override = _set_temp_override
+            except Exception:
+                set_temp_override = None
+            if set_temp_override:
+                set_temp_override("jikan_fetch_episodes", True)
+                # Fetch per-episode synopsis as well (best-effort). Can be slow.
+                set_temp_override("jikan_fetch_episode_details", True)
+        
+        ok = bool(enrichment_runner.enrich_one_serialized(int(media_item_id), providers_override=["jikan"]))
+        
+        if fetch_episodes and set_temp_override:
+            set_temp_override("jikan_fetch_episodes", None)  # Clear override
+            set_temp_override("jikan_fetch_episode_details", None)  # Clear override
+            
+        return {"ok": ok, "provider": "jikan", "detail": "enrich_failed" if not ok else None}
+    except Exception as e:
+        logger.exception("Manual Jikan enrichment failed for media_item=%s: %s", media_item_id, e)
+        return {"ok": False, "detail": "enrich_failed", "error": str(e)}
+
+
+def apply_manual_mapping_kitsu(
+    *,
+    db,
+    media_item_id: int,
+    kitsu_id: str,
+    season_number: int | None = None,
+    language: str = "es-MX",
+    title: str | None = None,
+    overview: str | None = None,
+    genres: list[str] | None = None,
+    poster_url: str | None = None,
+    backdrop_url: str | None = None,
+    season_title: str | None = None,
+    download_assets: bool | None = None,
+) -> dict:
+    mi = db.query(models.MediaItem).filter(models.MediaItem.id == media_item_id).first()
+    if not mi:
+        return {"ok": False, "detail": "media_item_not_found"}
+    try:
+        if not _is_anime_context_for_manual_mapping(db, mi):
+            logger.warning(
+                "Manual Kitsu mapping on non-anime context media_item=%s (explicit override)",
+                media_item_id,
+            )
+    except Exception:
+        pass
+    try:
+        raw = kitsu.fetch_by_id(str(kitsu_id).strip()) if kitsu and hasattr(kitsu, "fetch_by_id") else None
+        if not isinstance(raw, dict):
+            return {"ok": False, "detail": "not_found"}
+    except Exception as e:
+        logger.exception("Manual Kitsu fetch failed for media_item=%s kitsu_id=%s: %s", media_item_id, kitsu_id, e)
+        return {"ok": False, "detail": "fetch_failed", "error": str(e)}
+
+    try:
+        from . import enrichment as enrichment_service
+    except Exception as e:
+        logger.exception("Manual Kitsu enrichment service unavailable for media_item=%s: %s", media_item_id, e)
+        return {"ok": False, "detail": "service_unavailable", "error": str(e)}
+
+    try:
+        normalized = enrichment_service._normalize_kitsu(raw) if hasattr(enrichment_service, "_normalize_kitsu") else {}
+        if not isinstance(normalized, dict) or not normalized:
+            return {"ok": False, "detail": "normalize_failed"}
+
+        title_eff = str(title or normalized.get("title") or "").strip() or None
+        overview_eff = str(overview or normalized.get("synopsis") or normalized.get("overview") or "").strip() or None
+        genres_eff = genres if isinstance(genres, list) else (normalized.get("genres") if isinstance(normalized.get("genres"), list) else [])
+        images = dict(normalized.get("images") or {})
+        poster_eff = str(poster_url or images.get("poster") or "").strip() or None
+        backdrop_eff = str(backdrop_url or images.get("backdrop") or "").strip() or None
+        if poster_eff:
+            images["poster"] = poster_eff
+        if backdrop_eff:
+            images["backdrop"] = backdrop_eff
+        normalized["images"] = images
+        normalized["provider"] = "kitsu"
+        normalized["provider_id"] = str(kitsu_id).strip()
+        normalized["kitsu_id"] = str(kitsu_id).strip()
+        normalized["media_type"] = str(normalized.get("media_type") or "anime").strip().lower() or "anime"
+        if title_eff:
+            normalized["title"] = title_eff
+            normalized["series_title"] = title_eff
+        if overview_eff:
+            normalized["synopsis"] = overview_eff
+        if genres_eff:
+            normalized["genres"] = genres_eff
+
+        mi_any = cast(Any, mi)
+        _clear_manual_provider_rows(db, int(media_item_id))
+        _reset_media_item_manual_state(mi_any, clear_artwork=True, clear_descriptive=True)
+        mi_any.provider = "kitsu"
+        mi_any.provider_id = str(kitsu_id).strip()
+        try:
+            if mi_any.status in ("NO_MATCH", "ERROR", "MANUAL"):
+                mi_any.status = None
+        except Exception:
+            pass
+        db.add(mi_any)
+        try:
+            enrichment_service._attach_episodes("kitsu", normalized, normalized.get("media_type"), mi)
+        except Exception:
+            pass
+        enrichment_service._persist_metadata(db, mi, normalized)
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        logger.exception("Manual Kitsu mapping persist failed for media_item=%s: %s", media_item_id, e)
+        return {"ok": False, "detail": "db_commit_failed", "error": str(e)}
+
+    try:
+        out = apply_manual_mapping(
+            db=db,
+            media_item_id=int(media_item_id),
+            tmdb_id=None,
+            media_type=normalized.get("media_type"),
+            season_number=season_number,
+            language=language,
+            title=title_eff,
+            overview=overview_eff,
+            genres=genres_eff,
+            poster_url=poster_eff,
+            backdrop_url=backdrop_eff,
+            season_title=season_title,
+            episode_overrides=[],
+            download_assets=download_assets,
+            translation_only=False,
+            reset_provider_state=False,
+        )
+        if not out.get("ok"):
+            return out
+        mi_any = cast(Any, mi)
+        mi_any.provider = "kitsu"
+        mi_any.provider_id = str(kitsu_id).strip()
+        mi_any.status = "ENRICHED"
+        try:
+            mi_any.is_identified = True
+        except Exception:
+            pass
+        db.add(mi_any)
+        db.commit()
+        return {"ok": True, "provider": "kitsu", "item": out.get("item"), "normalized": out.get("normalized", False)}
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        logger.exception("Manual Kitsu finalize failed for media_item=%s: %s", media_item_id, e)
+        return {"ok": False, "detail": "manual_finalize_failed", "error": str(e)}
+
+
 def apply_manual_mapping(
     *,
     db,
@@ -222,9 +834,12 @@ def apply_manual_mapping(
     episode_overrides: list[dict[str, Any]] | None,
     download_assets: bool | None = None,
     translation_only: bool | None = None,
+    reset_provider_state: bool | None = True,
 ) -> dict:
     now = datetime.datetime.utcnow()
     translation_only = bool(translation_only)
+    incoming_poster_url = poster_url
+    incoming_backdrop_url = backdrop_url
     mi = db.query(models.MediaItem).filter(models.MediaItem.id == media_item_id).first()
     if not mi:
         return {"ok": False, "detail": "media_item_not_found"}
@@ -232,6 +847,23 @@ def apply_manual_mapping(
     mm = db.query(models.ManualMapping).filter(models.ManualMapping.media_item_id == media_item_id).first()
     if not mm:
         mm = models.ManualMapping(media_item_id=media_item_id)
+    # Detect identity changes early so we can clear stale season/episode metadata (best-effort)
+    # and force a refresh for the correct TMDB match.
+    prev_tmdb_id = None
+    prev_media_type = None
+    prev_season_number = None
+    try:
+        prev_tmdb_id = getattr(mm, "tmdb_id", None) or getattr(mi, "tmdb_id", None)
+    except Exception:
+        prev_tmdb_id = None
+    try:
+        prev_media_type = getattr(mm, "media_type", None) or getattr(mi, "media_type", None)
+    except Exception:
+        prev_media_type = None
+    try:
+        prev_season_number = getattr(mm, "season_number", None)
+    except Exception:
+        prev_season_number = None
     try:
         if poster_url is None:
             poster_url = getattr(mm, "poster_url", None)
@@ -247,6 +879,26 @@ def apply_manual_mapping(
     mm_any.backdrop_url = backdrop_url
     mm_any.updated_at = now
     db.add(mm_any)
+
+    replace_manual_assets = (not translation_only) and (
+        incoming_poster_url is not None or incoming_backdrop_url is not None
+    )
+    replace_poster_asset = bool(incoming_poster_url is not None and not _is_current_manual_asset_url(int(media_item_id), incoming_poster_url))
+    replace_backdrop_asset = bool(incoming_backdrop_url is not None and not _is_current_manual_asset_url(int(media_item_id), incoming_backdrop_url))
+    if (not translation_only) and bool(reset_provider_state):
+        try:
+            _clear_manual_provider_rows(db, int(media_item_id))
+        except Exception:
+            pass
+    if replace_manual_assets:
+        try:
+            _cleanup_manual_asset_dir(
+                int(media_item_id),
+                remove_poster=replace_poster_asset,
+                remove_backdrop=replace_backdrop_asset,
+            )
+        except Exception:
+            pass
 
     mo = (
         db.query(models.ManualOverride)
@@ -285,7 +937,31 @@ def apply_manual_mapping(
     if not translation_only:
         try:
             mi_any = cast(Any, mi)
+            if bool(reset_provider_state):
+                _reset_media_item_manual_state(
+                    mi_any,
+                    clear_artwork=replace_manual_assets or bool(tmdb_id),
+                    clear_descriptive=bool(tmdb_id or genres),
+                )
             if tmdb_id:
+                # Movies should be unique by TMDB id; TV series/seasons can share the same TMDB series id.
+                mt_l = (media_type or "").strip().lower()
+                allow_shared_tmdb_id = (mt_l in ("tv", "series", "show")) or (season_number is not None)
+                if not allow_shared_tmdb_id:
+                    try:
+                        conflict = (
+                            db.query(models.MediaItem)
+                            .filter(models.MediaItem.tmdb_id == tmdb_id, models.MediaItem.id != media_item_id)
+                            .first()
+                        )
+                        if conflict:
+                            logger.info("Conflict found for tmdb_id %s on item %s. Freeing it up.", tmdb_id, conflict.id)
+                            conflict.tmdb_id = None
+                            db.add(conflict)
+                            # No commit here yet; keep it inside the same transaction.
+                    except Exception as e:
+                        logger.warning("Error checking for tmdb_id conflicts: %s", e)
+
                 mi_any.tmdb_id = tmdb_id
             if media_type:
                 mi_any.media_type = media_type
@@ -311,37 +987,26 @@ def apply_manual_mapping(
         except Exception:
             pass
 
-    # Optional: download assets locally and re-point to /assets paths
-    if download_assets and not translation_only:
-        try:
-            base_dir = Path(DATA_DIR) / "assets" / str(media_item_id)
-            web_base = f"/media-assets/{media_item_id}"
-            local_poster = _download_to(poster_url, base_dir / "poster.jpg") if (poster_url and str(poster_url).startswith("http")) else None
-            local_backdrop = _download_to(backdrop_url, base_dir / "backdrop.jpg") if (backdrop_url and str(backdrop_url).startswith("http")) else None
-
-            if local_poster:
-                web_poster = f"{web_base}/{local_poster.name}"
-                mm_any.poster_url = web_poster
-                try:
-                    mi_any = cast(Any, mi)
-                    mi_any.poster_path = web_poster
-                    db.add(mi_any)
-                except Exception:
-                    pass
-            if local_backdrop:
-                web_backdrop = f"{web_base}/{local_backdrop.name}"
-                mm_any.backdrop_url = web_backdrop
-                try:
-                    mi_any = cast(Any, mi)
-                    mi_any.backdrop_path = web_backdrop
-                    db.add(mi_any)
-                except Exception:
-                    pass
-            db.add(mm_any)
-        except Exception:
-            logger.exception("Failed downloading assets for %s", media_item_id)
-
     season_id = None
+    identity_changed = False
+    try:
+        if tmdb_id and str(tmdb_id).strip() and str(prev_tmdb_id or "").strip():
+            identity_changed = str(tmdb_id).strip() != str(prev_tmdb_id).strip()
+        elif tmdb_id and str(tmdb_id).strip() and not str(prev_tmdb_id or "").strip():
+            identity_changed = True
+    except Exception:
+        identity_changed = False
+    try:
+        if media_type and str(media_type).strip() and str(prev_media_type or "").strip():
+            identity_changed = identity_changed or (str(media_type).strip() != str(prev_media_type).strip())
+    except Exception:
+        pass
+    try:
+        if season_number is not None and prev_season_number is not None:
+            identity_changed = identity_changed or (int(season_number) != int(prev_season_number))
+    except Exception:
+        pass
+
     if season_number is not None and not translation_only:
         try:
             si = db.query(models.SeasonItem).filter(models.SeasonItem.media_item_id == media_item_id).first()
@@ -356,9 +1021,63 @@ def apply_manual_mapping(
                         if language.lower().startswith("en") and not s_any.title_en:
                             s_any.title_en = season_title
                         s_any.title_localized = season_title
+                    if poster_url:
+                        s_any.poster_path = poster_url
+                    if backdrop_url:
+                        s_any.backdrop_path = backdrop_url
                     db.add(s_any)
         except Exception:
             season_id = None
+
+    # If identity changed (wrong TMDB match before), clear stale season/episode derived fields so a backfill
+    # can repopulate correct posters/synopsis/episode titles. Avoid clearing when explicit episode_overrides
+    # are provided (user is intentionally overriding).
+    if season_id and identity_changed and not translation_only:
+        try:
+            s = db.query(models.Season).filter(models.Season.id == season_id).first()
+            if s:
+                s_any = cast(Any, s)
+                try:
+                    s_any.synopsis_localized = None
+                except Exception:
+                    pass
+                try:
+                    s_any.poster_path = None
+                except Exception:
+                    pass
+                try:
+                    s_any.backdrop_path = None
+                except Exception:
+                    pass
+                db.add(s_any)
+        except Exception:
+            pass
+
+        if not episode_overrides:
+            try:
+                eps_only = db.query(models.Episode).filter(models.Episode.season_id == season_id).all()
+                for ep in eps_only:
+                    ep_any = cast(Any, ep)
+                    try:
+                        ep_any.title_localized = None
+                    except Exception:
+                        pass
+                    try:
+                        ep_any.synopsis_localized = None
+                    except Exception:
+                        pass
+                    # Force TMDB backfill to refresh EN titles too (it only updates when titles are generic).
+                    try:
+                        ep_any.title_en = None
+                    except Exception:
+                        pass
+                    try:
+                        ep_any.still_path = None
+                    except Exception:
+                        pass
+                    db.add(ep_any)
+            except Exception:
+                pass
 
     if season_id and episode_overrides and not translation_only:
         try:
@@ -503,11 +1222,143 @@ def apply_manual_mapping(
         except Exception:
             pass
 
+    # Commit the mapping/override/episode changes first (fast, DB-only).
+    # Downloading assets can be slow; doing it *inside* the same transaction increases the chance
+    # of sqlite lock contention and leads to user-visible `db_commit_failed`.
     try:
-        db.commit()
-    except Exception:
-        db.rollback()
-        return {"ok": False, "detail": "db_commit_failed"}
+        # Even with busy_timeout/WAL, concurrent writers (scan/enrichment) can briefly lock SQLite.
+        # Retry small commits a few times to avoid user-visible failures from transient locks.
+        last_err: str | None = None
+        for attempt in range(6):
+            try:
+                db.commit()
+                last_err = None
+                break
+            except Exception as e:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                try:
+                    last_err = str(e)
+                except Exception:
+                    last_err = "unknown"
+                msg_l = (last_err or "").lower()
+                if ("locked" in msg_l) or ("busy" in msg_l):
+                    time.sleep(0.25 * (attempt + 1))
+                    continue
+                raise
+        if last_err:
+            raise RuntimeError(last_err)
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        try:
+            msg = str(e)
+        except Exception:
+            msg = "unknown"
+        logger.exception("Manual mapping commit failed for media_item=%s: %s", media_item_id, msg)
+        return {"ok": False, "detail": "db_commit_failed", "error": msg}
+
+    normalized = False
+    if (not translation_only) and (media_type in ("tv", "series") or season_number is not None):
+        try:
+            normalized = _normalize_episodes_for_item(media_item_id)
+        except Exception:
+            normalized = False
+
+    # Manual mapping owns explicit artwork choices. Always replace local poster/backdrop
+    # files for selected remote images so stale cached assets cannot survive a correction.
+    if replace_manual_assets and not translation_only:
+        try:
+            base_dir = _cleanup_manual_asset_dir(
+                int(media_item_id),
+                remove_poster=replace_poster_asset,
+                remove_backdrop=replace_backdrop_asset,
+            )
+            web_base = f"/media-assets/{media_item_id}"
+            local_poster = _download_to(incoming_poster_url, base_dir / "poster.jpg") if _is_remote_asset_url(incoming_poster_url) else None
+            local_backdrop = _download_to(incoming_backdrop_url, base_dir / "backdrop.jpg") if _is_remote_asset_url(incoming_backdrop_url) else None
+
+            desired_poster = f"{web_base}/{local_poster.name}" if local_poster else (incoming_poster_url if incoming_poster_url and not replace_poster_asset else None)
+            desired_backdrop = f"{web_base}/{local_backdrop.name}" if local_backdrop else (incoming_backdrop_url if incoming_backdrop_url and not replace_backdrop_asset else None)
+            any_updated = bool(desired_poster or desired_backdrop)
+            if any_updated:
+                # Very small commit, but sqlite can still be busy/locked. Retry a few times.
+                for attempt in range(3):
+                    try:
+                        if desired_poster:
+                            try:
+                                mm_any.poster_url = desired_poster
+                            except Exception:
+                                pass
+                            try:
+                                mi_any = cast(Any, mi)
+                                mi_any.poster_path = desired_poster
+                                db.add(mi_any)
+                            except Exception:
+                                pass
+                            try:
+                                if season_id:
+                                    s = db.query(models.Season).filter(models.Season.id == season_id).first()
+                                    if s:
+                                        cast(Any, s).poster_path = desired_poster
+                                        db.add(s)
+                            except Exception:
+                                pass
+                        if desired_backdrop:
+                            try:
+                                mm_any.backdrop_url = desired_backdrop
+                            except Exception:
+                                pass
+                            try:
+                                mi_any = cast(Any, mi)
+                                mi_any.backdrop_path = desired_backdrop
+                                db.add(mi_any)
+                            except Exception:
+                                pass
+                            try:
+                                if season_id:
+                                    s = db.query(models.Season).filter(models.Season.id == season_id).first()
+                                    if s:
+                                        cast(Any, s).backdrop_path = desired_backdrop
+                                        db.add(s)
+                            except Exception:
+                                pass
+                        try:
+                            db.add(mm_any)
+                        except Exception:
+                            pass
+                        db.commit()
+                        break
+                    except Exception as e:
+                        try:
+                            db.rollback()
+                        except Exception:
+                            pass
+                        msg = str(e)
+                        if "locked" in msg.lower() or "busy" in msg.lower():
+                            time.sleep(0.2 * (attempt + 1))
+                            continue
+                        raise
+        except Exception as e:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            logger.exception("Failed downloading/applying assets for media_item=%s: %s", media_item_id, e)
+
+    # Best-effort: for TMDB TV seasons, immediately backfill season synopsis + episodes titles/overviews/stills.
+    # Manual mapping marks items as MANUAL and the background enrichment runner skips those, so without this
+    # the season can remain stale/wrong until the user forces a re-enrich.
+    if season_id and tmdb_id and (not translation_only) and (media_type in ("tv", "series") or season_number is not None):
+        try:
+            from . import enrichment as enrichment_service
+            enrichment_service.backfill_tmdb_episode_titles_for_media_item(int(media_item_id), manage_state=False)
+        except Exception:
+            pass
 
     try:
         poster_out = None
@@ -535,6 +1386,7 @@ def apply_manual_mapping(
                 "poster_path": poster_out,
                 "backdrop_path": backdrop_out,
             },
+            "normalized": bool(normalized),
         }
     except Exception:
-        return {"ok": True}
+        return {"ok": True, "normalized": bool(normalized)}

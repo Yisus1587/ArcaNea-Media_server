@@ -5,7 +5,10 @@ import secrets
 import threading
 import time
 
-from ..core import config as core_config
+try:
+    from ..core import config as core_config
+except ImportError:  # pragma: no cover
+    from src.core import config as core_config  # type: ignore
 
 _TOKENS: dict[str, float] = {}
 _LOCK = threading.Lock()

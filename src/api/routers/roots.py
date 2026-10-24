@@ -3,11 +3,11 @@ from __future__ import annotations
 import logging
 import os
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException
 
 from ...db import models
 from .. import runtime
-from ..services import scan as scan_service
+from ...services import media_pipeline as scan_service
 from ..deps import get_db, admin_required
 
 router = APIRouter()
@@ -33,18 +33,34 @@ def list_roots_pending_confirmation(db=Depends(get_db), _: bool = Depends(admin_
 
 
 @router.post("/api/roots")
-def add_root(payload: dict, background_tasks: BackgroundTasks, db=Depends(get_db), _: bool = Depends(admin_required)):
+def add_root(payload: dict, db=Depends(get_db), _: bool = Depends(admin_required)):
     path = payload.get("path") if isinstance(payload, dict) else None
+    requested_type = payload.get("type") if isinstance(payload, dict) else None
     if not path:
         raise HTTPException(status_code=400, detail="path is required")
     ap = os.path.abspath(path)
+
+    def _normalize_type(raw: str | None) -> str | None:
+        if not raw:
+            return None
+        try:
+            t = str(raw).strip().lower()
+        except Exception:
+            return None
+        if not t or t in ("auto", "unknown", "unset", "none", "null", "infer", "inferred"):
+            return None
+        if t in ("tv", "show", "shows"):
+            t = "series"
+        if t not in ("anime", "movie", "series"):
+            return None
+        return t
 
     def _infer_type_from_path(p: str) -> str:
         b = os.path.basename(p).lower()
         LIBRARY_RULES = {
             "anime": ["anime", "animes"],
             "movie": ["pelicula", "peliculas", "movie", "movies", "film", "films"],
-            "tv": ["serie", "series", "tv", "show", "shows"],
+            "series": ["serie", "series", "tv", "show", "shows"],
         }
         for k, tokens in LIBRARY_RULES.items():
             for t in tokens:
@@ -54,11 +70,25 @@ def add_root(payload: dict, background_tasks: BackgroundTasks, db=Depends(get_db
 
     exists = db.query(models.MediaRoot).filter(models.MediaRoot.path == ap).first()
     if exists:
+        # If user explicitly provided a type, update existing root to manual.
+        explicit = _normalize_type(requested_type)
+        if explicit:
+            try:
+                exists.type = explicit
+                exists.source = "manual"
+                db.add(exists)
+                db.commit()
+            except Exception:
+                db.rollback()
         return {"roots": [{"path": i.path, "type": i.type, "source": i.source} for i in db.query(models.MediaRoot).all()]}
 
     try:
-        inferred = _infer_type_from_path(ap)
-        mr = models.MediaRoot(path=ap, type=inferred, source="auto")
+        explicit = _normalize_type(requested_type)
+        if explicit:
+            mr = models.MediaRoot(path=ap, type=explicit, source="manual")
+        else:
+            inferred = _infer_type_from_path(ap)
+            mr = models.MediaRoot(path=ap, type=inferred, source="auto")
         db.add(mr)
         db.commit()
     except Exception:
@@ -70,7 +100,7 @@ def add_root(payload: dict, background_tasks: BackgroundTasks, db=Depends(get_db
     except Exception:
         pass
     try:
-        background_tasks.add_task(scan_service.scan_path_with_pipeline, ap)
+        scan_service.enqueue_scan_path(ap, pipeline=True)
     except Exception:
         pass
     return {"roots": [{"path": i.path, "type": i.type, "source": i.source} for i in items]}
@@ -102,6 +132,18 @@ def update_root(payload: dict, db=Depends(get_db), _: bool = Depends(admin_requi
     if not path or not t:
         raise HTTPException(status_code=400, detail="path and type are required")
     ap = os.path.abspath(path)
+    try:
+        t = str(t).strip().lower()
+    except Exception:
+        t = None
+    if not t:
+        raise HTTPException(status_code=400, detail="type is required")
+    if t in ("tv", "show", "shows"):
+        t = "series"
+    if t in ("auto", "unknown", "unset", "none", "null", "infer", "inferred"):
+        t = "unknown"
+    if t not in ("anime", "movie", "series", "unknown"):
+        raise HTTPException(status_code=400, detail="invalid type")
     try:
         mr = db.query(models.MediaRoot).filter(models.MediaRoot.path == ap).first()
         if not mr:

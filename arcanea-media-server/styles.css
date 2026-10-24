@@ -1,0 +1,106 @@
+@import "tailwindcss";
+@import "/fonts/inter-local.css";
+
+:root {
+  color-scheme: dark;
+  --app-bg: #0a0f1a;
+  --app-panel: rgba(18, 24, 38, 0.85);
+  --app-panel-border: rgba(148, 163, 184, 0.14);
+  --app-accent: #79c2ff;
+  --app-accent-2: #9a7bff;
+  --app-glow: rgba(121, 194, 255, 0.18);
+}
+
+body {
+  background-color: var(--app-bg);
+  color: #f8fafc;
+  font-family: "Inter", "Satoshi", "Manrope", "Segoe UI Variable", "Segoe UI", sans-serif;
+}
+
+.app-shell {
+  position: relative;
+  background:
+    radial-gradient(1200px 600px at 10% -10%, rgba(121, 194, 255, 0.18), transparent 60%),
+    radial-gradient(900px 500px at 90% 0%, rgba(154, 123, 255, 0.14), transparent 55%),
+    radial-gradient(700px 500px at 50% 100%, rgba(20, 184, 166, 0.12), transparent 60%),
+    var(--app-bg);
+}
+
+.app-shell::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(148, 163, 184, 0.08) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(148, 163, 184, 0.08) 1px, transparent 1px);
+  background-size: 80px 80px;
+  opacity: 0.18;
+  pointer-events: none;
+}
+
+.app-shell::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(400px 280px at 20% 20%, rgba(255, 255, 255, 0.08), transparent 60%);
+  opacity: 0.35;
+  pointer-events: none;
+  mix-blend-mode: screen;
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #0b1220;
+}
+::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #475569;
+}
+
+.glass-panel {
+  background: var(--app-panel);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--app-panel-border);
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35);
+}
+
+.media-card-sheen {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.12), transparent 60%);
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  pointer-events: none;
+}
+
+.media-card:hover .media-card-sheen {
+  opacity: 0.8;
+}
+
+.hero-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.65);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.hide-scrollbar {
+  -ms-overflow-style: none; /* IE and Edge */
+  scrollbar-width: none; /* Firefox */
+}
+.hide-scrollbar::-webkit-scrollbar {
+  display: none; /* Chrome, Safari */
+}

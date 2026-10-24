@@ -91,6 +91,8 @@ BACKUP_DIR = DB_PATH.parent
 
 ALTER_STATEMENTS = [
     ("mal_id", "TEXT"),
+    ("jikan_type", "TEXT"),
+    ("jikan_anchor_mal_id", "TEXT"),
     ("poster_path", "TEXT"),
     ("is_animated", "INTEGER"),
     ("origin", "TEXT"),
@@ -100,6 +102,7 @@ ALTER_STATEMENTS = [
     ("tmdb_id", "TEXT"),
     ("backdrop_path", "TEXT"),
     ("rating", "REAL"),
+    ("content_rating", "TEXT"),
     ("genres", "TEXT"),
     ("search_titles", "TEXT"),
     ("is_identified", "INTEGER"),
@@ -138,6 +141,7 @@ CREATE TABLE IF NOT EXISTS series (
     title_localized TEXT,
     mal_id TEXT,
     tmdb_id TEXT,
+    jikan_type TEXT,
     tmdb_no_match INTEGER,
     tmdb_no_match_reason TEXT,
     year INTEGER,
@@ -152,6 +156,10 @@ CREATE TABLE IF NOT EXISTS season (
     season_number INTEGER,
     title_en TEXT,
     title_localized TEXT,
+    synopsis_localized TEXT,
+    poster_path TEXT,
+    backdrop_path TEXT,
+    split_cour INTEGER,
     FOREIGN KEY(series_id) REFERENCES series(id) ON DELETE CASCADE
 );
 '''
@@ -165,6 +173,7 @@ CREATE TABLE IF NOT EXISTS episode (
     title_en TEXT,
     title_localized TEXT,
     synopsis_localized TEXT,
+    still_path TEXT,
     FOREIGN KEY(season_id) REFERENCES season(id) ON DELETE CASCADE
 );
 '''
@@ -174,6 +183,7 @@ CREATE TABLE IF NOT EXISTS season_item (
     id INTEGER PRIMARY KEY,
     season_id INTEGER NOT NULL UNIQUE,
     media_item_id INTEGER NOT NULL UNIQUE,
+    media_id TEXT,
     created_at DATETIME,
     FOREIGN KEY(season_id) REFERENCES season(id) ON DELETE CASCADE,
     FOREIGN KEY(media_item_id) REFERENCES media_item(id) ON DELETE CASCADE
@@ -252,11 +262,20 @@ CREATE TABLE IF NOT EXISTS play_history (
     play_count INTEGER,
     last_played DATETIME,
     watched INTEGER,
+    last_position REAL,
+    last_duration REAL,
+    last_path TEXT,
     created_at DATETIME,
     updated_at DATETIME,
     FOREIGN KEY(media_item_id) REFERENCES media_item(id) ON DELETE CASCADE
 );
 '''
+
+PLAY_HISTORY_ALTERS = [
+    ("last_position", "REAL"),
+    ("last_duration", "REAL"),
+    ("last_path", "TEXT"),
+]
 
 INDEX_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS ix_settings_updated ON settings(updated_at);",
@@ -265,7 +284,9 @@ INDEX_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS ix_episode_season_number ON episode(season_id, episode_number);",
     "CREATE INDEX IF NOT EXISTS ix_episode_file_episode ON episode_file(episode_id);",
     "CREATE INDEX IF NOT EXISTS ix_season_item_media ON season_item(media_item_id);",
+    "CREATE INDEX IF NOT EXISTS ix_season_item_media_id ON season_item(media_id);",
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_series_provider_id ON series(provider_id);",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_series_tmdb_id ON series(tmdb_id);",
     "CREATE INDEX IF NOT EXISTS ix_series_tmdb_no_match ON series(tmdb_no_match);",
     "CREATE INDEX IF NOT EXISTS ix_media_translations_path_lang ON media_translations(path_id, language);",
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_media_translations_path_lang_source ON media_translations(path_id, language, source);",
@@ -274,6 +295,8 @@ INDEX_STATEMENTS = [
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_user_list_profile_item ON user_list(profile_id, media_item_id);",
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_play_history_profile_item ON play_history(profile_id, media_item_id);",
     "CREATE INDEX IF NOT EXISTS ix_play_history_last_played ON play_history(last_played);",
+    "DROP INDEX IF EXISTS ux_media_item_tmdb_movie;",
+    "CREATE INDEX IF NOT EXISTS ix_media_item_tmdb_movie ON media_item(tmdb_id) WHERE tmdb_id IS NOT NULL AND tmdb_id <> '' AND (media_type = 'movie' OR media_type = 'film');",
 ]
 
 
@@ -333,6 +356,106 @@ def _index_name_from_stmt(stmt: str) -> str | None:
     return None
 
 
+def _dedupe_series_by_tmdb(conn: sqlite3.Connection) -> None:
+    try:
+        rows = conn.execute(
+            """
+            SELECT tmdb_id, MIN(id) as keep_id, COUNT(*) as cnt
+            FROM series
+            WHERE tmdb_id IS NOT NULL AND tmdb_id <> ''
+            GROUP BY tmdb_id
+            HAVING cnt > 1
+            """
+        ).fetchall()
+    except Exception:
+        rows = []
+    for tmdb_id, keep_id, _cnt in rows:
+        try:
+            # Move seasons to the kept series id
+            conn.execute(
+                "UPDATE season SET series_id=? WHERE series_id IN (SELECT id FROM series WHERE tmdb_id=? AND id<>?)",
+                (int(keep_id), str(tmdb_id), int(keep_id)),
+            )
+            # Delete duplicate series rows
+            conn.execute(
+                "DELETE FROM series WHERE tmdb_id=? AND id<>?",
+                (str(tmdb_id), int(keep_id)),
+            )
+        except Exception:
+            continue
+
+
+def _dedupe_movie_items_by_tmdb(conn: sqlite3.Connection) -> None:
+    try:
+        rows = conn.execute(
+            """
+            SELECT tmdb_id, MIN(id) as keep_id, COUNT(*) as cnt
+            FROM media_item
+            WHERE tmdb_id IS NOT NULL AND tmdb_id <> '' AND (media_type='movie' OR media_type='film')
+            GROUP BY tmdb_id
+            HAVING cnt > 1
+            """
+        ).fetchall()
+    except Exception:
+        rows = []
+
+    for tmdb_id, keep_id, _cnt in rows:
+        try:
+            dup_ids = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT id FROM media_item WHERE tmdb_id=? AND id<>? AND (media_type='movie' OR media_type='film')",
+                    (str(tmdb_id), int(keep_id)),
+                ).fetchall()
+            ]
+        except Exception:
+            dup_ids = []
+        if not dup_ids:
+            continue
+        # Repoint foreign keys to keep_id
+        for tbl, col in (
+            ("file_record", "media_item_id"),
+            ("media_metadata", "media_item_id"),
+            ("media_image", "media_item_id"),
+            ("media_translations", "path_id"),
+            ("manual_mappings", "media_item_id"),
+            ("manual_overrides", "media_item_id"),
+            ("user_list", "media_item_id"),
+            ("play_history", "media_item_id"),
+            ("season_item", "media_item_id"),
+        ):
+            try:
+                conn.execute(
+                    f"UPDATE {tbl} SET {col}=? WHERE {col} IN ({','.join(['?'] * len(dup_ids))})",
+                    [int(keep_id), *[int(x) for x in dup_ids]],
+                )
+            except Exception:
+                pass
+        # Repoint media_relation edges
+        try:
+            conn.execute(
+                f"UPDATE media_relation SET from_item_id=? WHERE from_item_id IN ({','.join(['?'] * len(dup_ids))})",
+                [int(keep_id), *[int(x) for x in dup_ids]],
+            )
+        except Exception:
+            pass
+        try:
+            conn.execute(
+                f"UPDATE media_relation SET to_item_id=? WHERE to_item_id IN ({','.join(['?'] * len(dup_ids))})",
+                [int(keep_id), *[int(x) for x in dup_ids]],
+            )
+        except Exception:
+            pass
+        # Drop duplicate media_item rows
+        try:
+            conn.execute(
+                f"DELETE FROM media_item WHERE id IN ({','.join(['?'] * len(dup_ids))})",
+                [int(x) for x in dup_ids],
+            )
+        except Exception:
+            pass
+
+
 def main():
     if not DB_PATH.exists():
         print(f"Database not found at {DB_PATH}. Nothing to migrate.")
@@ -374,11 +497,28 @@ def main():
                 missing_schema = True
         if table_exists(conn, "season"):
             sc = get_columns(conn, "season")
-            if any(n not in sc for n in ("title_en", "title_localized")):
+            if any(
+                n not in sc
+                for n in (
+                    "title_en",
+                    "title_localized",
+                    "synopsis_localized",
+                    "poster_path",
+                    "tmdb_season_number",
+                    "tmdb_episode_start",
+                    "tmdb_episode_end",
+                    "air_date_start",
+                    "air_date_end",
+                )
+            ):
                 missing_schema = True
         if table_exists(conn, "episode"):
             ec = get_columns(conn, "episode")
-            if any(n not in ec for n in ("title_en", "title_localized", "synopsis_localized")):
+            if any(n not in ec for n in ("title_en", "title_localized", "synopsis_localized", "still_path", "air_date", "episode_type")):
+                missing_schema = True
+        if table_exists(conn, "play_history"):
+            phc = get_columns(conn, "play_history")
+            if any(n not in phc for n, _t in PLAY_HISTORY_ALTERS):
                 missing_schema = True
 
         for stmt in INDEX_STATEMENTS:
@@ -398,6 +538,7 @@ def main():
             print(f"Backup created: {bak}")
 
         ensure_columns('media_item', ALTER_STATEMENTS)
+        ensure_columns('play_history', PLAY_HISTORY_ALTERS)
         # create media_image table
         print("Ensuring media_image table exists")
         conn.execute(MEDIA_IMAGE_CREATE)
@@ -428,6 +569,7 @@ def main():
             ('title_localized', 'TEXT'),
             ('mal_id', 'TEXT'),
             ('tmdb_id', 'TEXT'),
+            ('jikan_type', 'TEXT'),
             ('tmdb_no_match', 'INTEGER'),
             ('tmdb_no_match_reason', 'TEXT'),
             ('year', 'INTEGER'),
@@ -436,12 +578,36 @@ def main():
         ensure_columns('season', [
             ('title_en', 'TEXT'),
             ('title_localized', 'TEXT'),
+            ('synopsis_localized', 'TEXT'),
+            ('poster_path', 'TEXT'),
+            ('backdrop_path', 'TEXT'),
+            ('tmdb_season_number', 'INTEGER'),
+            ('tmdb_episode_start', 'INTEGER'),
+            ('tmdb_episode_end', 'INTEGER'),
+            ('air_date_start', 'TEXT'),
+            ('air_date_end', 'TEXT'),
+            ('split_cour', 'INTEGER'),
+        ])
+        ensure_columns('season_item', [
+            ('media_id', 'TEXT'),
         ])
         ensure_columns('episode', [
             ('title_en', 'TEXT'),
             ('title_localized', 'TEXT'),
             ('synopsis_localized', 'TEXT'),
+            ('still_path', 'TEXT'),
+            ('air_date', 'TEXT'),
+            ('episode_type', 'TEXT'),
         ])
+        # Dedupe TMDB ids before creating unique indexes.
+        try:
+            _dedupe_series_by_tmdb(conn)
+        except Exception:
+            pass
+        try:
+            _dedupe_movie_items_by_tmdb(conn)
+        except Exception:
+            pass
         for stmt in INDEX_STATEMENTS:
             try:
                 conn.execute(stmt)

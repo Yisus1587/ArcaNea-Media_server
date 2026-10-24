@@ -6,11 +6,30 @@ import os
 import hashlib
 import re
 import time
-from src.tools.cache import cache_get, cache_set  # type: ignore
+from src.tools.cache import cache_get, cache_set, cache_get_negative, cache_set_negative  # type: ignore
 from src.core.config import config
 from src.utils.utils import map_tmdb_genres  # type: ignore
+try:
+    from src.utils.rate_limiter import get_limiter
+    _rate_limiter = get_limiter("tmdb")
+except Exception:
+    _rate_limiter = None
+try:
+    from src.services import telemetry  # type: ignore
+except Exception:
+    try:
+        from ..services import telemetry  # type: ignore
+    except Exception:
+        telemetry = None
 
 TMDB_API_BASE = "https://api.themoviedb.org/3"
+
+
+def _debug_suppressed(exc: Exception) -> None:
+    try:
+        logging.debug("provider_tmdb: suppressed exception: %s", exc)
+    except Exception:
+        return
 
 # Throttling controls to avoid network saturation.
 _API_CONCURRENCY = max(1, int(os.environ.get("ARCANEA_API_CONCURRENCY", "2") or 2))
@@ -32,6 +51,50 @@ except Exception:
     _cooldown_lock = None
 
 
+def _pick_tmdb_tv_rating(data):
+    try:
+        results = data.get("results") if isinstance(data, dict) else None
+        if not isinstance(results, list):
+            return None
+        for r in results:
+            if isinstance(r, dict) and r.get("iso_3166_1") == "US":
+                rating = r.get("rating")
+                if rating:
+                    return str(rating).strip()
+        for r in results:
+            if isinstance(r, dict):
+                rating = r.get("rating")
+                if rating:
+                    return str(rating).strip()
+    except Exception:
+        return None
+    return None
+
+
+def _pick_tmdb_movie_rating(data):
+    try:
+        results = data.get("results") if isinstance(data, dict) else None
+        if not isinstance(results, list):
+            return None
+        for r in results:
+            if isinstance(r, dict) and r.get("iso_3166_1") == "US":
+                for rd in (r.get("release_dates") or []):
+                    if isinstance(rd, dict):
+                        cert = rd.get("certification")
+                        if cert:
+                            return str(cert).strip()
+        for r in results:
+            if isinstance(r, dict):
+                for rd in (r.get("release_dates") or []):
+                    if isinstance(rd, dict):
+                        cert = rd.get("certification")
+                        if cert:
+                            return str(cert).strip()
+    except Exception:
+        return None
+    return None
+
+
 def create_session_with_retries(total_retries=3, backoff_factor=0.5, status_forcelist=(429, 500, 502, 503, 504)):
     session = requests.Session()
     # In some dev environments, HTTP(S)_PROXY is set to a non-working local proxy
@@ -45,8 +108,8 @@ def create_session_with_retries(total_retries=3, backoff_factor=0.5, status_forc
             hsp = str(os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or "").strip().lower()
             if hp.startswith("http://127.0.0.1:9") or hsp.startswith("http://127.0.0.1:9"):
                 session.trust_env = False
-    except Exception:
-        pass
+    except Exception as e:
+        _debug_suppressed(e)
     retries = Retry(total=total_retries, backoff_factor=backoff_factor, status_forcelist=status_forcelist, allowed_methods=frozenset(['GET', 'POST']))
     adapter = HTTPAdapter(max_retries=retries)
     session.mount('http://', adapter)
@@ -82,8 +145,8 @@ def _normalize_tmdb_language(language: str | None) -> str | None:
         parts = lang.split("-")
         if len(parts) == 2 and len(parts[0]) == 2 and len(parts[1]) in (2, 3):
             return f"{parts[0].lower()}-{parts[1].upper()}"
-    except Exception:
-        pass
+    except Exception as e:
+        _debug_suppressed(e)
     return lang
 
 def tmdb_check_connection(force: bool = False, api_key: str | None = None, access_token: str | None = None) -> bool:
@@ -133,9 +196,20 @@ def _parse_tmdb_url(url):
         m2 = re.search(r"([0-9]{3,})", path)
         if m2:
             return m2.group(1), None, None
-    except Exception:
-        pass
+    except Exception as e:
+        _debug_suppressed(e)
     return None, None, None
+
+
+def _tmdb_timeout(default: float = 10.0) -> float:
+    try:
+        raw = os.environ.get("ARCANEA_TMDB_TIMEOUT_SEC") or os.environ.get("ARCANEA_TMDB_TIMEOUT")
+        if raw is None:
+            return float(default)
+        val = float(raw)
+        return val if val > 0 else float(default)
+    except Exception:
+        return float(default)
 
 
 def _tmdb_get(path, params=None, headers=None, timeout=10):
@@ -166,10 +240,29 @@ def _tmdb_get(path, params=None, headers=None, timeout=10):
             log_params = {}
         logging.debug("provider_tmdb._tmdb_get: GET %s params=%s headers=%s", path, log_params, list(h.keys()))
         resp = None
+        status_code = None
+        err_msg = None
+        try:
+            if timeout is None:
+                timeout = _tmdb_timeout()
+            else:
+                timeout = _tmdb_timeout(float(timeout))
+        except Exception:
+            timeout = _tmdb_timeout()
         if _api_sema:
             _api_sema.acquire()
         try:
+            t0 = time.perf_counter()
+            try:
+                if _rate_limiter is not None:
+                    _rate_limiter.before_request()
+            except Exception as e:
+                _debug_suppressed(e)
             resp = session.get(f"{TMDB_API_BASE}/{path}", params=p or None, headers=h or None, timeout=timeout)
+            try:
+                status_code = int(getattr(resp, "status_code", 0) or 0)
+            except Exception:
+                status_code = None
             logging.debug("provider_tmdb._tmdb_get: response status=%s for %s", getattr(resp, 'status_code', None), path)
             try:
                 sc = int(getattr(resp, 'status_code', 0) or 0)
@@ -184,10 +277,10 @@ def _tmdb_get(path, params=None, headers=None, timeout=10):
                         if ra is not None:
                             try:
                                 wait = max(wait, int(ra))
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
+                            except Exception as e:
+                                _debug_suppressed(e)
+                except Exception as e:
+                    _debug_suppressed(e)
                 until = time.time() + float(wait)
                 try:
                     if _cooldown_lock:
@@ -195,26 +288,46 @@ def _tmdb_get(path, params=None, headers=None, timeout=10):
                             _cooldown_until_ts = max(_cooldown_until_ts, until)
                     else:
                         _cooldown_until_ts = max(_cooldown_until_ts, until)
-                except Exception:
-                    pass
+                except Exception as e:
+                    _debug_suppressed(e)
             resp.raise_for_status()
             try:
                 j = resp.json()
                 if isinstance(j, dict):
                     logging.debug("provider_tmdb._tmdb_get: returned keys=%s for %s", list(j.keys()), path)
+                try:
+                    if _rate_limiter is not None:
+                        _rate_limiter.record_success(latency_ms=(time.perf_counter() - t0) * 1000.0)
+                except Exception as e:
+                    _debug_suppressed(e)
                 return j
             except Exception:
                 logging.debug("provider_tmdb._tmdb_get: response not JSON for %s", path)
                 return None
+        except Exception as e:
+            err_msg = str(e)
+            try:
+                if _rate_limiter is not None:
+                    _rate_limiter.record_failure(status_code=status_code, exc=e)
+            except Exception as e:
+                _debug_suppressed(e)
+            raise
         finally:
             try:
+                try:
+                    if telemetry is not None:
+                        dt = (time.perf_counter() - t0) * 1000.0 if 't0' in locals() else 0.0
+                        telemetry.emit_api_timing("tmdb", str(path), dt, status_code=status_code, error=err_msg)
+                except Exception as e:
+                    _debug_suppressed(e)
                 if resp is not None:
                     resp.close()
-            except Exception:
-                pass
+            except Exception as e:
+                _debug_suppressed(e)
             if _api_sema:
                 _api_sema.release()
-            if _API_DELAY_SEC > 0:
+            # When rate limiter is active, avoid double-throttling here.
+            if _API_DELAY_SEC > 0 and _rate_limiter is None:
                 time.sleep(_API_DELAY_SEC)
     except Exception as e:
         # Best-effort cooldown on "429/504" like failures even if we don't have a response object here.
@@ -228,8 +341,8 @@ def _tmdb_get(path, params=None, headers=None, timeout=10):
                         _cooldown_until_ts = max(_cooldown_until_ts, until)
                 else:
                     _cooldown_until_ts = max(_cooldown_until_ts, until)
-        except Exception:
-            pass
+        except Exception as e:
+            _debug_suppressed(e)
         logging.debug("provider_tmdb._tmdb_get: GET %s failed: %s", path, e)
         return None
 
@@ -255,9 +368,8 @@ def tmdb_fetch_by_id(tmdb_id, media_type=None, api_key=None, access_token=None, 
     if lang_norm:
         try:
             params_base['language'] = str(lang_norm)
-        except Exception:
-            pass
-
+        except Exception as e:
+            _debug_suppressed(e)
     if media_type and str(media_type).lower().startswith('tv'):
         candidates = ['tv', 'movie']
     elif media_type:
@@ -287,6 +399,8 @@ def tmdb_fetch_by_id(tmdb_id, media_type=None, api_key=None, access_token=None, 
 
     poster = details.get('poster_path')
     poster_url = f"https://image.tmdb.org/t/p/original{poster}" if poster else ''
+    backdrop = details.get("backdrop_path")
+    backdrop_url = f"https://image.tmdb.org/t/p/original{backdrop}" if backdrop else ""
     genre_ids = [g.get('id') for g in (details.get('genres') or []) if isinstance(g, dict)]
     mapped_genres = map_tmdb_genres(",".join(str(gid) for gid in genre_ids))
     # Additional helpful fields for UI (dates/status/counts) while keeping response compact.
@@ -314,6 +428,17 @@ def tmdb_fetch_by_id(tmdb_id, media_type=None, api_key=None, access_token=None, 
         number_of_episodes = details.get('number_of_episodes') if isinstance(details.get('number_of_episodes'), int) else None
     except Exception:
         number_of_episodes = None
+    content_rating = None
+    try:
+        if used_type and str(used_type).lower().startswith("tv"):
+            cr = _tmdb_get(f"tv/{tmdb_id}/content_ratings", params=params_base, headers=headers)
+            content_rating = _pick_tmdb_tv_rating(cr)
+        else:
+            rd = _tmdb_get(f"movie/{tmdb_id}/release_dates", params=params_base, headers=headers)
+            content_rating = _pick_tmdb_movie_rating(rd)
+    except Exception:
+        content_rating = None
+
     normalized = {
         'provider': 'tmdb',
         'provider_id': int(tmdb_id) if str(tmdb_id).isdigit() else tmdb_id,
@@ -324,13 +449,17 @@ def tmdb_fetch_by_id(tmdb_id, media_type=None, api_key=None, access_token=None, 
         'synopsis': details.get('overview') or '',
         'genre_ids': genre_ids,
         'genres': mapped_genres,
-        'images': {'jpg': {'large_image_url': poster_url}} if poster_url else {},
+        'images': {
+            **({'jpg': {'large_image_url': poster_url}} if poster_url else {}),
+            **({'backdrop': {'large_image_url': backdrop_url}} if backdrop_url else {}),
+        },
         'release_date': release_date,
         'first_air_date': first_air_date,
         'last_air_date': last_air_date,
         'status': status,
         'number_of_seasons': number_of_seasons,
         'number_of_episodes': number_of_episodes,
+        'content_rating': content_rating,
     }
     return normalized
 
@@ -374,9 +503,8 @@ def tmdb_fetch_season(tmdb_id, season_number, api_key=None, access_token=None, l
     if lang_norm:
         try:
             params['language'] = str(lang_norm)
-        except Exception:
-            pass
-
+        except Exception as e:
+            _debug_suppressed(e)
     try:
         logging.debug("provider_tmdb.tmdb_fetch_season: GET tv/%s/season/%s", tmdb_id, season_number)
         data = _tmdb_get(f"tv/{tmdb_id}/season/{season_number}", params=params, headers=headers)
@@ -398,15 +526,25 @@ def tmdb_fetch_season(tmdb_id, season_number, api_key=None, access_token=None, l
 
         episodes = []
         for ep in data.get('episodes', []) or []:
+            still = ep.get('still_path')
+            still_url = f"https://image.tmdb.org/t/p/original{still}" if still else None
             episodes.append({
                 'episode_number': ep.get('episode_number'),
                 'title': ep.get('name') or '',
                 'overview': ep.get('overview') or '',
                 'air_date': ep.get('air_date') or None,
+                'episode_type': ep.get('episode_type') or None,
+                'still_path': still_url,
             })
 
         poster = data.get('poster_path')
         poster_url = f"https://image.tmdb.org/t/p/original{poster}" if poster else ''
+        backdrop = None
+        try:
+            backdrop = (series_meta or {}).get("backdrop_path") if isinstance(series_meta, dict) else None
+        except Exception:
+            backdrop = None
+        backdrop_url = f"https://image.tmdb.org/t/p/original{backdrop}" if backdrop else ""
         season_num_str = str(season_number) if season_number is not None else ""
         try:
             lang0 = str(lang_norm or "").lower()
@@ -430,8 +568,13 @@ def tmdb_fetch_season(tmdb_id, season_number, api_key=None, access_token=None, l
             'title': display_title,
             'series_title': series_title or (season_label or ''),
             'synopsis': data.get('overview') or '',
+            'poster_path': poster_url or None,
+            'backdrop_path': backdrop_url or None,
             'episodes': episodes,
-            'images': {'jpg': {'large_image_url': poster_url}} if poster_url else {},
+            'images': {
+                **({'jpg': {'large_image_url': poster_url}} if poster_url else {}),
+                **({'backdrop': {'large_image_url': backdrop_url}} if backdrop_url else {}),
+            },
         }
         return normalized
     except Exception as e:
@@ -474,7 +617,7 @@ def tmdb_get_genres(api_key=None):
         return {}
 
 
-def tmdb_search(query, media_preference='auto', api_key=None, access_token=None, allow_when_config_is_jikan=False):
+def tmdb_search(query, media_preference='auto', api_key=None, access_token=None, allow_when_config_is_jikan=False, ignore_negative_cache: bool = False):
     # Deterministic TMDB search flow:
     # 1) explicit TMDB URL -> resolve directly (no cache)
     # 2) explicit numeric id -> fetch directly (no cache)
@@ -495,9 +638,27 @@ def tmdb_search(query, media_preference='auto', api_key=None, access_token=None,
 
         # 2) numeric id
         if isinstance(query, str) and re.fullmatch(r"\d+", query.strip()):
-            resolved = tmdb_fetch_by_id(query.strip(), api_key=api_key, access_token=access_token)
-            if resolved:
-                return resolved
+            # Respect caller preference: if we were asked for TV-only or Movie-only, don't allow
+            # cross-type results (this can otherwise mis-map season marker strings like "2").
+            try:
+                pref0 = str(media_preference or "auto").strip().lower()
+            except Exception:
+                pref0 = "auto"
+            numeric_is_movie_title = bool(pref0 == "movie" and re.fullmatch(r"(?:19|20)\d{2}", query.strip()))
+            mt_hint = None
+            if pref0 == "tv":
+                mt_hint = "tv"
+            elif pref0 == "movie" and not numeric_is_movie_title:
+                mt_hint = "movie"
+            if not numeric_is_movie_title:
+                resolved = tmdb_fetch_by_id(query.strip(), media_type=mt_hint, api_key=api_key, access_token=access_token)
+                if resolved:
+                    try:
+                        if mt_hint and str(resolved.get("media_type") or "").strip().lower() != mt_hint:
+                            return None
+                    except Exception:
+                        pass
+                    return resolved
 
         # If no API credentials available for fuzzy search, bail out
         if not key and not access_token:
@@ -511,8 +672,15 @@ def tmdb_search(query, media_preference='auto', api_key=None, access_token=None,
         else:
             params_base["api_key"] = key
         params_base["page"] = 1
-        # NOTE: We intentionally don't force language here. Search should default to English
-        # for deterministic matching unless a caller explicitly wants localized search.
+        # Use the configured metadata language for search. TMDB still returns
+        # original_title/original_name, so English filenames remain matchable while
+        # Spanish/localized filenames can resolve to the intended translated title.
+        try:
+            lang_norm = _normalize_tmdb_language(config.get("metadata_language"))
+        except Exception:
+            lang_norm = None
+        if lang_norm:
+            params_base["language"] = str(lang_norm)
 
         def make_variants(q):
             variants = [q]
@@ -520,23 +688,94 @@ def tmdb_search(query, media_preference='auto', api_key=None, access_token=None,
                 return variants
             cleaned = re.sub(r"[_\.-]+", " ", q)
             cleaned = re.sub(r"\(.*?\)|\[.*?\]", "", cleaned).strip()
+            cleaned = re.sub(
+                r"(?i)\b(?:hdts|cam|latino|castellano|espanol|dual|multi|webrip|web[- ]?dl|bdrip|brrip|bluray|hdrip|hdr|x264|x265|hevc|aac|mkv|mp4|tg)\b",
+                " ",
+                cleaned,
+            )
             cleaned = re.sub(r"\b(19|20)\d{2}\b", "", cleaned).strip()
             cleaned = re.sub(r"\s+", " ", cleaned)
             if cleaned and cleaned not in variants:
                 variants.append(cleaned)
+            # Handle sequels encoded as leading numbers: "3 John Wick" -> "John Wick", "John Wick 3".
+            try:
+                m_lead = re.match(r"^\s*(\d{1,2})\s+(.+)$", cleaned)
+                if m_lead:
+                    num = int(m_lead.group(1))
+                    rest = (m_lead.group(2) or "").strip()
+                    if rest and rest not in variants:
+                        variants.append(rest)
+                    with_num = f"{rest} {num}".strip()
+                    if with_num and with_num not in variants:
+                        variants.append(with_num)
+            except Exception as e:
+                _debug_suppressed(e)
             no_articles = re.sub(r"\b(the|a|an)\b", "", cleaned, flags=re.IGNORECASE).strip()
             no_articles = re.sub(r"\s+", " ", no_articles)
             if no_articles and no_articles not in variants:
                 variants.append(no_articles)
             return variants
 
+        def _extract_release_year(cand: dict) -> int | None:
+            try:
+                rd = cand.get("release_date") or cand.get("first_air_date") or ""
+                if not rd:
+                    return None
+                m = re.match(r"^\s*((?:19|20)\d{2})", str(rd))
+                if not m:
+                    return None
+                return int(m.group(1))
+            except Exception as e:
+                _debug_suppressed(e)
+                return None
+
         # Only cache fuzzy textual searches
-        def cache_key_for(query_text, media_pref):
+        def cache_key_for(query_text, media_pref, anchor_year_hint=None):
             norm = (query_text or '').strip().lower()
-            key_src = f"tmdb:search:{media_pref}:{norm}"
+            y = ""
+            try:
+                if anchor_year_hint is not None:
+                    y = str(int(anchor_year_hint))
+            except Exception:
+                y = ""
+            lang_key = str(params_base.get("language") or "").strip().lower()
+            key_src = f"tmdb:search:{media_pref}:lang:{lang_key}:{norm}:y:{y}"
             return hashlib.sha256(key_src.encode('utf-8')).hexdigest()
 
         queries = [query] if not isinstance(query, (list, tuple)) else [q for q in query if q]
+        # Keep deterministic order but prioritize candidates that carry an explicit year token.
+        # This avoids stale no-year cache hits overriding more precise "Title 2024" anchors.
+        try:
+            dedup: list[str] = []
+            seen_q: set[str] = set()
+            for q in queries:
+                s = str(q).strip()
+                if not s:
+                    continue
+                k = s.lower()
+                if k in seen_q:
+                    continue
+                seen_q.add(k)
+                dedup.append(s)
+            queries = sorted(
+                dedup,
+                key=lambda s: (0 if re.search(r"\b(?:19|20)\d{2}\b", s) else 1, len(s)),
+            )
+        except Exception:
+            try:
+                queries = [str(q) for q in queries if str(q).strip()]
+            except Exception:
+                pass
+
+        global_anchor_year = None
+        try:
+            for q in queries:
+                m = re.search(r"\b(19|20)\d{2}\b", str(q or ""))
+                if m:
+                    global_anchor_year = int(m.group(0))
+                    break
+        except Exception:
+            global_anchor_year = None
         overall_best = None
         overall_best_score = -1.0
         overall_media_type = None
@@ -545,37 +784,60 @@ def tmdb_search(query, media_preference='auto', api_key=None, access_token=None,
             if not candidate:
                 continue
             candidate = str(candidate)
+            cache_key = None
+            m_year = re.search(r"\b(19|20)\d{2}\b", candidate or "")
+            year_match_val = m_year.group(0) if m_year else None
+            try:
+                anchor_year = int(year_match_val) if year_match_val else (
+                    int(global_anchor_year) if global_anchor_year is not None else None
+                )
+            except Exception:
+                anchor_year = None
+            year_filter_val = year_match_val or (str(anchor_year) if anchor_year is not None else None)
+            try:
+                cache_key = cache_key_for(candidate, media_preference, anchor_year)
+                if cache_get_negative(cache_key) and not ignore_negative_cache:
+                    continue
+                cached = cache_get(cache_key)
+                if cached is not None:
+                    return cached
+            except Exception as e:
+                _debug_suppressed(e)
             variants = make_variants(candidate)
 
             # Try movie or tv based on preference
             pref = (media_preference or 'auto').lower()
 
-            # Build search order deterministically
+            # Build search order deterministically.
+            # IMPORTANT: When caller requests a specific type ('tv' or 'movie'), do NOT fall back
+            # to the other type. This avoids mis-identifications from generic folder names like
+            # "Temp 1" or "Season 2" that can match unrelated movies.
             if pref == 'movie':
-                endpoints = ['search/movie', 'search/tv']
+                endpoints = ['search/movie']
             elif pref == 'tv':
-                endpoints = ['search/tv', 'search/movie']
+                endpoints = ['search/tv']
             else:
                 endpoints = ['search/movie', 'search/tv']
 
             results = []
             media_type = None
-            m_year = re.search(r"\b(19|20)\d{2}\b", candidate or "")
-            year_match_val = m_year.group(0) if m_year else None
 
             for ep in endpoints:
                 for qv in variants:
                     try:
                         params = dict(params_base)
                         params['query'] = qv
-                        if year_match_val:
+                        if year_filter_val:
                             if ep.endswith('/movie'):
-                                params['year'] = year_match_val
+                                params['year'] = year_filter_val
                             else:
-                                params['first_air_date_year'] = year_match_val
+                                params['first_air_date_year'] = year_filter_val
                         data = _tmdb_get(ep, params=params, headers=headers)
                         results = data.get('results') or [] if data else []
-                        if not results and year_match_val:
+                        # If this variant already contains an explicit year token, skip the immediate
+                        # no-year fallback so the next cleaned variant can be tried (e.g. "Dune 1984" -> "Dune").
+                        has_year_in_variant = bool(re.search(r"\b(?:19|20)\d{2}\b", str(qv or "")))
+                        if not results and year_filter_val and not has_year_in_variant:
                             params_fallback = dict(params_base)
                             params_fallback['query'] = qv
                             data = _tmdb_get(ep, params=params_fallback, headers=headers)
@@ -590,11 +852,18 @@ def tmdb_search(query, media_preference='auto', api_key=None, access_token=None,
                     break
 
             if not results:
+                try:
+                    if cache_key:
+                        cache_set_negative(cache_key, True)
+                except Exception as e:
+                    _debug_suppressed(e)
                 continue
 
             # scoring heuristics preserved
             import difflib
             qnorm = (candidate or "").strip().lower()
+            qnorm_no_year = re.sub(r"\b(?:19|20)\d{2}\b", " ", qnorm)
+            qnorm_no_year = re.sub(r"\s{2,}", " ", qnorm_no_year).strip()
             tv_hint = bool(re.search(r"season\b|s\d{1,2}\b|temporada\b", (candidate or "").lower()))
 
             best = None
@@ -611,11 +880,25 @@ def tmdb_search(query, media_preference='auto', api_key=None, access_token=None,
                 cand_title = title_candidates[0] if title_candidates else ''
                 short_query = len(qnorm) <= 3
 
+                if anchor_year is not None:
+                    try:
+                        cy = _extract_release_year(cand)
+                        tol = 1 if str(media_type or "").strip().lower() == "tv" else 0
+                        if cy is None or abs(int(cy) - int(anchor_year)) > tol:
+                            continue
+                    except Exception as e:
+                        _debug_suppressed(e)
+                        continue
+
                 def _score_for(title_text: str) -> tuple[float, float]:
                     token_ratio = 0.0
                     if tokens:
-                        matched = sum(1 for t in tokens if t in title_text)
-                        token_ratio = matched / len(tokens)
+                        try:
+                            words = set(re.findall(r"\w+", title_text))
+                            matched = sum(1 for t in tokens if t in words)
+                        except Exception:
+                            matched = 0
+                        token_ratio = matched / len(tokens) if tokens else 0.0
                     sim = difflib.SequenceMatcher(None, qnorm, title_text).ratio()
                     return token_ratio, sim
 
@@ -623,8 +906,16 @@ def tmdb_search(query, media_preference='auto', api_key=None, access_token=None,
                     best = cand
                     best_score = 1.0
                     break
+                if qnorm_no_year and any(t == qnorm_no_year for t in title_candidates):
+                    # Query contains a year but title may not; boost exact title-no-year matches.
+                    token_ratio, sim = _score_for(cand_title)
+                    score = 0.6 * token_ratio + 0.3 * sim + 0.28
+                    if score > best_score:
+                        best_score = score
+                        best = cand
+                    continue
 
-                if short_query and title_candidates:
+                if title_candidates:
                     ratios = [_score_for(t) for t in title_candidates]
                     token_ratio = max(r[0] for r in ratios)
                     sim = max(r[1] for r in ratios)
@@ -634,7 +925,7 @@ def tmdb_search(query, media_preference='auto', api_key=None, access_token=None,
                 year_bonus = 0.0
                 try:
                     release = cand.get('release_date') or cand.get('first_air_date') or ''
-                    if release and year_match_val and release.startswith(year_match_val):
+                    if release and year_filter_val and release.startswith(str(year_filter_val)):
                         year_bonus = 0.2
                 except Exception as e:
                     logging.debug("tmdb_search: year bonus compute failed: %s", e)
@@ -648,6 +939,9 @@ def tmdb_search(query, media_preference='auto', api_key=None, access_token=None,
                     best = cand
 
             if best is None:
+                # If the query includes an explicit year, do not force-pick a mismatched candidate.
+                if anchor_year is not None:
+                    continue
                 best = results[0]
 
             # prefer most recent among exact-title matches
@@ -737,6 +1031,8 @@ def tmdb_search(query, media_preference='auto', api_key=None, access_token=None,
 
         poster = details.get('poster_path') or best.get('poster_path')
         poster_url = f"https://image.tmdb.org/t/p/original{poster}" if poster else ''
+        backdrop = details.get("backdrop_path") or best.get("backdrop_path")
+        backdrop_url = f"https://image.tmdb.org/t/p/original{backdrop}" if backdrop else ""
 
         genre_ids = [g.get('id') for g in (details.get('genres') or []) if isinstance(g, dict)]
         mapped_genres = map_tmdb_genres(",".join(str(gid) for gid in genre_ids))
@@ -765,6 +1061,17 @@ def tmdb_search(query, media_preference='auto', api_key=None, access_token=None,
             number_of_episodes = details.get('number_of_episodes') if isinstance(details.get('number_of_episodes'), int) else None
         except Exception:
             number_of_episodes = None
+        content_rating = None
+        try:
+            params = dict(params_base)
+            if media_type == 'tv':
+                cr = _tmdb_get(f"tv/{tmdb_id}/content_ratings", params=params, headers=headers)
+                content_rating = _pick_tmdb_tv_rating(cr)
+            else:
+                rd = _tmdb_get(f"movie/{tmdb_id}/release_dates", params=params, headers=headers)
+                content_rating = _pick_tmdb_movie_rating(rd)
+        except Exception:
+            content_rating = None
         normalized = {
             'provider': 'tmdb',
             'provider_id': tmdb_id,
@@ -774,13 +1081,17 @@ def tmdb_search(query, media_preference='auto', api_key=None, access_token=None,
             'synopsis': details.get('overview') or best.get('overview') or '',
             'genre_ids': genre_ids,
             'genres': mapped_genres,
-            'images': {'jpg': {'large_image_url': poster_url}} if poster_url else {},
+            'images': {
+                **({'jpg': {'large_image_url': poster_url}} if poster_url else {}),
+                **({'backdrop': {'large_image_url': backdrop_url}} if backdrop_url else {}),
+            },
             'release_date': release_date,
             'first_air_date': first_air_date,
             'last_air_date': last_air_date,
             'status': status,
             'number_of_seasons': number_of_seasons,
             'number_of_episodes': number_of_episodes,
+            'content_rating': content_rating,
         }
         normalized['series_title'] = normalized.get('title') or ''
 
@@ -798,7 +1109,7 @@ def tmdb_search(query, media_preference='auto', api_key=None, access_token=None,
         raise
 
 
-def tmdb_search_by_type(title, type_hint=None, api_key=None, access_token=None, allow_when_config_is_jikan=False):
+def tmdb_search_by_type(title, type_hint=None, api_key=None, access_token=None, allow_when_config_is_jikan=False, ignore_negative_cache: bool = False):
     try:
         pref = 'auto'
         if type_hint:
@@ -807,7 +1118,7 @@ def tmdb_search_by_type(title, type_hint=None, api_key=None, access_token=None, 
                 pref = 'tv'
             elif any(k in th for k in ('pelicula', 'movie', 'film')):
                 pref = 'movie'
-        return tmdb_search(title, media_preference=pref, api_key=api_key, access_token=access_token, allow_when_config_is_jikan=allow_when_config_is_jikan)
+        return tmdb_search(title, media_preference=pref, api_key=api_key, access_token=access_token, allow_when_config_is_jikan=allow_when_config_is_jikan, ignore_negative_cache=ignore_negative_cache)
     except Exception:
         return None
 
@@ -872,7 +1183,7 @@ def search(query, api_key=None, access_token=None):
     return tmdb_search(q, media_preference="auto", api_key=api_key, access_token=access_token)
 
 
-def search_by_type(title, media_preference="auto", api_key=None, access_token=None, allow_when_config_is_jikan=False):
+def search_by_type(title, media_preference="auto", api_key=None, access_token=None, allow_when_config_is_jikan=False, ignore_negative_cache: bool = False):
     if title is None:
         return None
     t = str(title).strip()
@@ -892,4 +1203,5 @@ def search_by_type(title, media_preference="auto", api_key=None, access_token=No
         api_key=api_key,
         access_token=access_token,
         allow_when_config_is_jikan=allow_when_config_is_jikan,
+        ignore_negative_cache=ignore_negative_cache,
     )

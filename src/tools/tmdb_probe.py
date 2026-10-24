@@ -13,13 +13,28 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
+# Ensure repo root is on sys.path for local dev runs.
+try:
+    _repo_root = Path(__file__).resolve().parents[2]
+    if str(_repo_root) not in sys.path:
+        sys.path.insert(0, str(_repo_root))
+except Exception:
+    pass
+
+# Backend uses src.core directly; no legacy shim needed.
+
+_import_err = None
 try:
     from ..providers import provider_tmdb as tmdb  # type: ignore
-except Exception:
+except Exception as e:
+    _import_err = e
     try:
         from src.providers import provider_tmdb as tmdb  # type: ignore
-    except Exception:  # pragma: no cover
+        _import_err = None
+    except Exception as e2:  # pragma: no cover
+        _import_err = e2
         tmdb = None
 
 
@@ -40,14 +55,20 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     if tmdb is None:
-        _die("TMDB provider not importable (src.providers.provider_tmdb).")
+        detail = f"{_import_err}" if _import_err else "unknown import error"
+        _die(f"TMDB provider not importable (src.providers.provider_tmdb): {detail}")
 
     lang = args.lang.strip() or None
 
     out: dict = {"ok": True}
 
     if args.query:
-        res = tmdb.search_by_type(args.query, media_preference=args.pref, allow_when_config_is_jikan=True)
+        if hasattr(tmdb, "tmdb_search_by_type"):
+            res = tmdb.tmdb_search_by_type(args.query, type_hint=args.pref, allow_when_config_is_jikan=True)
+        elif hasattr(tmdb, "tmdb_search"):
+            res = tmdb.tmdb_search(args.query, media_preference=args.pref, allow_when_config_is_jikan=True)
+        else:
+            res = None
         out["search"] = res
         if isinstance(res, dict):
             out["tmdb_id"] = res.get("tmdb_id") or res.get("provider_id")
@@ -78,4 +99,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

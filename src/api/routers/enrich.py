@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import logging
 
+import json
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from ...db import SessionLocal, models
 from ...services.enrich_state import get_state as get_enrich_state
+from ...services.scan_state import get_state as get_scan_state
 from ...services.enrichment_runner import (
     request_stop as request_enrich_stop,
     set_paused as set_enrich_paused,
@@ -53,6 +57,12 @@ def enrich_start(_: bool = Depends(admin_required)):
     """Request the enrichment runner to start (non-blocking)."""
     try:
         try:
+            st = get_scan_state()
+            if (st.get("status") or "").lower() in ("scanning", "queued"):
+                return {"started": False, "detail": "scan_in_progress"}
+        except Exception:
+            pass
+        try:
             apply_db_migrations_main()
         except Exception:
             logging.getLogger(__name__).exception("DB migration failed before enrichment")
@@ -92,10 +102,44 @@ def enrich_stop(_: bool = Depends(admin_required)):
 
 
 @router.post("/api/enrich/reset-no-match")
-def enrich_reset_no_match(_: bool = Depends(admin_required)):
+def enrich_reset_no_match(anime_provider: str | None = None, start: bool = False, _: bool = Depends(admin_required)):
     """Reset items marked as NO_MATCH back to SCANNED so they can be retried."""
     db = SessionLocal()
     try:
+        # Optional: set provider mode for anime retries ("jikan" | "kitsu" | "tmdb" | "auto").
+        # Stored in settings.metadata.animeProvider so long-running servers pick it up without restart.
+        try:
+            if anime_provider is not None:
+                ap = str(anime_provider or "").strip().lower()
+                if ap in ("jikan", "kitsu", "tmdb", "auto"):
+                    row = db.query(models.Setting).filter(models.Setting.key == "metadata").first()
+                    md = {}
+                    if row and getattr(row, "value", None):
+                        try:
+                            md = json.loads(getattr(row, "value") or "") or {}
+                        except Exception:
+                            md = {}
+                    if not isinstance(md, dict):
+                        md = {}
+                    md2 = dict(md)
+                    md2["animeProvider"] = ap
+                    raw = json.dumps(md2, ensure_ascii=False)
+                    if row:
+                        row.value = raw
+                        try:
+                            row.updated_at = datetime.utcnow()
+                        except Exception:
+                            pass
+                        db.add(row)
+                    else:
+                        db.add(models.Setting(key="metadata", value=raw))
+                    db.commit()
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
         subq = (
             db.query(models.MediaMetadata.media_item_id)
             .filter(models.MediaMetadata.provider != None)  # noqa: E711
@@ -115,7 +159,83 @@ def enrich_reset_no_match(_: bool = Depends(admin_required)):
         except Exception:
             db.rollback()
             raise
-        return {"reset": len(items)}
+        out = {"reset": len(items)}
+        if start:
+            try:
+                started = start_enrichment_job()
+                out["started"] = bool(started)
+            except Exception:
+                out["started"] = False
+        return out
+    finally:
+        db.close()
+
+
+@router.post("/api/enrich/reset-error")
+def enrich_reset_error(anime_provider: str | None = None, start: bool = False, _: bool = Depends(admin_required)):
+    """Reset items marked as ERROR back to SCANNED so they can be retried."""
+    db = SessionLocal()
+    try:
+        # Same optional provider mode as reset-no-match.
+        try:
+            if anime_provider is not None:
+                ap = str(anime_provider or "").strip().lower()
+                if ap in ("jikan", "kitsu", "tmdb", "auto"):
+                    row = db.query(models.Setting).filter(models.Setting.key == "metadata").first()
+                    md = {}
+                    if row and getattr(row, "value", None):
+                        try:
+                            md = json.loads(getattr(row, "value") or "") or {}
+                        except Exception:
+                            md = {}
+                    if not isinstance(md, dict):
+                        md = {}
+                    md2 = dict(md)
+                    md2["animeProvider"] = ap
+                    raw = json.dumps(md2, ensure_ascii=False)
+                    if row:
+                        row.value = raw
+                        try:
+                            row.updated_at = datetime.utcnow()
+                        except Exception:
+                            pass
+                        db.add(row)
+                    else:
+                        db.add(models.Setting(key="metadata", value=raw))
+                    db.commit()
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+        subq = (
+            db.query(models.MediaMetadata.media_item_id)
+            .filter(models.MediaMetadata.provider != None)  # noqa: E711
+            .filter(models.MediaMetadata.provider != "")
+        )
+        q = (
+            db.query(models.MediaItem)
+            .filter(~models.MediaItem.id.in_(subq))
+            .filter(models.MediaItem.status == "ERROR")
+        )
+        items = q.all()
+        for mi in items:
+            mi.status = "SCANNED"
+            db.add(mi)
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        out = {"reset": len(items)}
+        if start:
+            try:
+                started = start_enrichment_job()
+                out["started"] = bool(started)
+            except Exception:
+                out["started"] = False
+        return out
     finally:
         db.close()
 
@@ -156,4 +276,18 @@ def enrich_repair_series(dry_run: bool = False, _: bool = Depends(admin_required
         return enrichment_service.repair_series_grouping_by_tmdb(dry_run=bool(dry_run))
     except Exception:
         logging.getLogger(__name__).exception("Unexpected error in repair-series")
+        raise HTTPException(status_code=500, detail="Unexpected error")
+
+
+@router.post("/api/enrich/backfill-images")
+def enrich_backfill_images(limit_items: int | None = None, _: bool = Depends(admin_required)):
+    """Download missing posters/backdrops using existing cached metadata image URLs."""
+    try:
+        try:
+            apply_db_migrations_main()
+        except Exception:
+            logging.getLogger(__name__).exception("DB migration failed before backfill-images")
+        return enrichment_service.backfill_cached_images(limit_items=limit_items, manage_state=True)
+    except Exception:
+        logging.getLogger(__name__).exception("Unexpected error in backfill-images")
         raise HTTPException(status_code=500, detail="Unexpected error")

@@ -1,8 +1,6 @@
-import { useState, useEffect, useMemo, useCallback } from 'react';
+import { Suspense, lazy, useState, useEffect, useMemo, useCallback } from 'react';
 import { Sidebar } from './components/layout/Sidebar';
 import { ErrorBoundary } from './components/system/ErrorBoundary';
-import { MediaDetailModal } from './components/media/MediaDetailModal';
-import { VideoPlayer } from './components/player/VideoPlayer';
 import { SplashScreen } from './components/ui/SplashScreen';
 import { ProfileSelector } from './components/auth/ProfileSelector';
 import { SetupWizard } from './components/setup/SetupWizard';
@@ -11,7 +9,7 @@ import { AppContent } from './components/app/AppContent';
 import { MediaService, normalizeRoots, setAdminMode } from './services/api';
 import { MediaItem, ViewState, MetadataConfig, AppStage, UserProfile } from './types';
 import { Button } from './components/ui/Button';
-import { defaultMetadataLanguageForUiLang, detectSystemUiLang, getStoredUiLang, getStoredUiLangSource, useI18n } from './i18n/i18n';
+import { defaultMetadataLanguageForUiLang, detectSystemLocale, detectSystemUiLang, getStoredUiLang, getStoredUiLangSource, normalizeMetadataLanguageFromLocale, useI18n } from './i18n/i18n';
 import { useNotifications } from './hooks/useNotifications';
 import { useRecommendations } from './hooks/useRecommendations';
 import { usePlayerState } from './hooks/usePlayerState';
@@ -20,13 +18,27 @@ import { useProfilesState } from './hooks/useProfilesState';
 import { useSettingsState } from './hooks/useSettingsState';
 import { useMediaLibrary } from './hooks/useMediaLibrary';
 
+const MediaDetailModal = lazy(() =>
+  import('./components/media/MediaDetailModal').then((module) => ({ default: module.MediaDetailModal })),
+);
+const VideoPlayer = lazy(() =>
+  import('./components/player/VideoPlayer').then((module) => ({ default: module.VideoPlayer })),
+);
+
 function App() {
   const { lang, setLang, t } = useI18n();
   // UI locale is separate from provider metadata locale: TMDB doesn't reliably accept `es-419`.
   const defaultUiLocale = (detectSystemUiLang() === 'es') ? 'es-419' : 'en-US';
   const defaultProviderLanguage = defaultMetadataLanguageForUiLang(lang);
   const { notification, showNotification, clearNotification } = useNotifications();
-  const { metadataConfig, setMetadataConfig, libraryPaths, setLibraryPaths } = useConfigState(defaultProviderLanguage);
+  const {
+    metadataConfig,
+    setMetadataConfig,
+    libraryPaths,
+    setLibraryPaths,
+    looseMovieRoots,
+    setLooseMovieRoots,
+  } = useConfigState(defaultProviderLanguage);
   // System State
   const [appStage, setAppStage] = useState<AppStage>('booting');
   const [currentUser, setCurrentUser] = useState<UserProfile | null>(null);
@@ -90,6 +102,7 @@ function App() {
     appStage,
     metadataConfig,
     libraryPaths,
+    looseMovieRoots,
     currentUser,
     setCurrentUser,
     onLogout: handleLogout,
@@ -109,6 +122,9 @@ function App() {
     handleAddPath,
     handleRemovePath,
     handleUpdateMetadataConfig,
+    handleToggleLooseMovieRoot,
+    rootTypes,
+    handleSetRootType,
   } = useSettingsState({
     appStage,
     currentUser,
@@ -117,6 +133,8 @@ function App() {
     setMetadataConfig,
     libraryPaths,
     setLibraryPaths,
+    looseMovieRoots,
+    setLooseMovieRoots,
     profiles,
     showNotification,
     fetchMedia,
@@ -124,14 +142,19 @@ function App() {
     setLoading,
   });
 
+  const [dismissOffline, setDismissOffline] = useState(false);
+  useEffect(() => {
+    if (!serverOffline) setDismissOffline(false);
+  }, [serverOffline]);
+
   // Settings States handled via hooks
 
   // Keep metadata localization language aligned with UI language (per user choice),
   // and persist UI language preference to backend config.
   useEffect(() => {
-    if (appStage === 'booting' || appStage === 'setup') return;
+    if (appStage !== 'app') return;
     try {
-      const desired = defaultMetadataLanguageForUiLang(lang);
+      let desired = defaultMetadataLanguageForUiLang(lang);
       const nextMeta =
         metadataConfig.language === desired
           ? metadataConfig
@@ -144,12 +167,16 @@ function App() {
       const storedSource = getStoredUiLangSource();
       const storedLang = getStoredUiLang();
       const uiSource = storedSource ?? (storedLang ? 'manual' : 'system');
+      if (uiSource === 'system') {
+        desired = normalizeMetadataLanguageFromLocale(detectSystemLocale());
+      }
 
       void MediaService.saveAppConfig({
         setupComplete: true,
         profiles,
         metadata: nextMeta,
         media_roots: libraryPaths,
+        loose_movie_roots: looseMovieRoots,
         target_lang: lang,
         ui_lang_source: uiSource,
       });
@@ -224,6 +251,7 @@ function App() {
           setCurrentUser(null);
           if (cfg.metadata) setMetadataConfig(cfg.metadata);
           if (cfg.media_roots) setLibraryPaths(normalizeRoots(cfg.media_roots));
+          if ((cfg as any).loose_movie_roots) setLooseMovieRoots(normalizeRoots((cfg as any).loose_movie_roots));
           setCurrentView('home');
           setSearchQuery('');
           setAppStage('profile_select');
@@ -365,12 +393,8 @@ function App() {
   };
   // --- Data Fetching ---
   useEffect(() => {
-    if (appStage === 'app') {
-      if (currentView === 'settings') {
-        fetchSettingsData();
-      } else {
-        void fetchMedia({ reset: true });
-      }
+    if (appStage === 'app' && currentView === 'settings') {
+      fetchSettingsData();
     }
   }, [currentView, appStage]);
 
@@ -381,9 +405,6 @@ function App() {
     }
     setCurrentView(view);
     setSearchQuery(''); // Clear search when navigating categories
-    if (view === 'list') {
-      void refreshUserList(currentUser);
-    }
   };
 
   useEffect(() => {
@@ -398,6 +419,41 @@ function App() {
     return mediaItems;
   }, [currentView, userListItems, mediaItems, searchQuery, localSearchActive, localSearchResults]);
 
+  const displayItems = useMemo(() => {
+    if (currentView === 'list') return baseItems;
+    if (!baseItems.length) return baseItems;
+    const groups = new Map<string, MediaItem[]>();
+    const standalone: MediaItem[] = [];
+    for (const it of baseItems) {
+      if (!it) continue;
+      const seriesId = (it.seriesId ?? it.tmdbId) ? String(it.seriesId ?? it.tmdbId) : '';
+      if (seriesId) {
+        const key = `series:${seriesId}`;
+        const arr = groups.get(key);
+        if (arr) arr.push(it);
+        else groups.set(key, [it]);
+      } else {
+        standalone.push(it);
+      }
+    }
+    const pickRepresentative = (items: MediaItem[]) => {
+      if (items.length === 1) return items[0];
+      const withSeason = items.filter((i) => typeof i.seasonNumber === 'number' && !Number.isNaN(i.seasonNumber));
+      if (withSeason.length) {
+        withSeason.sort((a, b) => (a.seasonNumber ?? 0) - (b.seasonNumber ?? 0));
+        return withSeason[0];
+      }
+      const byDate = [...items].sort((a, b) => (a.addedAt || '').localeCompare(b.addedAt || ''));
+      return byDate[0];
+    };
+    const out: MediaItem[] = [];
+    for (const items of groups.values()) {
+      const rep = pickRepresentative(items);
+      if (rep) out.push(rep);
+    }
+    return [...out, ...standalone];
+  }, [baseItems, currentView]);
+
   const {
     recordPlay,
     inProgressItems,
@@ -409,7 +465,7 @@ function App() {
     currentUser,
     currentView,
     searchQuery,
-    baseItems,
+    baseItems: displayItems,
   });
 
   const {
@@ -417,11 +473,13 @@ function App() {
     playingSrc,
     playerSeasons,
     nowPlayingLabel,
+    playingStartTime,
     handlePlay,
     handleNextPlayingItem,
     handlePrevPlayingItem,
     handleContinueNextSeries,
     handleSelectEpisode,
+    handleProgressUpdate,
     closePlayer,
     hasPrevItem,
     hasNextItem,
@@ -453,7 +511,7 @@ function App() {
       profileLoadingHint={profileLoadingHint}
       searchQuery={searchQuery}
       lang={lang}
-      baseItems={baseItems}
+      baseItems={displayItems}
       userListLoading={userListLoading}
       suggestedItems={suggestedItems}
       hasMoreMedia={hasMoreMedia}
@@ -471,6 +529,10 @@ function App() {
       onAddPath={handleAddPath}
       onRemovePath={handleRemovePath}
       onUpdateConfig={handleUpdateMetadataConfig}
+      looseMovieRoots={looseMovieRoots}
+      onToggleLooseMovieRoot={handleToggleLooseMovieRoot}
+      rootTypes={rootTypes}
+      onSetRootType={handleSetRootType}
       onRefreshSettings={fetchSettingsData}
       onAddProfile={handleAddProfile}
       onUpdateProfile={handleUpdateProfile}
@@ -478,6 +540,7 @@ function App() {
       onSelectMedia={handleMediaClick}
       onPlay={handlePlay}
       onRefreshMedia={() => fetchMedia({ reset: true })}
+      onLoadMoreMedia={() => fetchMedia({ reset: false })}
     />
   );
 
@@ -499,9 +562,9 @@ function App() {
   };
 
   return (
-    <div className="min-h-screen bg-[#0b1220] text-slate-100 flex overflow-hidden font-sans selection:bg-indigo-500/30 relative">
+    <div className="app-shell min-h-screen text-slate-100 flex overflow-hidden font-sans selection:bg-indigo-500/30 relative">
       {/* Offline Overlay */}
-      {serverOffline ? (
+      {serverOffline && !dismissOffline ? (
         <div className="fixed inset-0 z-[999] bg-black/75 backdrop-blur-sm flex items-center justify-center p-6">
           <div className="w-full max-w-md rounded-2xl border border-white/10 bg-slate-950/90 shadow-2xl p-6">
             <div className="text-lg font-bold text-white">{t('server_offline_title')}</div>
@@ -509,6 +572,12 @@ function App() {
               {t('server_offline_desc')}
             </div>
             <div className="mt-5 flex justify-end gap-2">
+              <button
+                onClick={() => setDismissOffline(true)}
+                className="px-3 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-white text-sm font-semibold transition"
+              >
+                {t('server_offline_hide')}
+              </button>
               <button
                 onClick={() => window.location.reload()}
                 className="px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-semibold transition"
@@ -619,12 +688,17 @@ function App() {
 	           <ErrorBoundary
 	             resetKey={`${appStage}:${currentView}:${searchQuery}:${currentUser?.id ?? 'no-user'}`}
 	             onError={(e) => console.error('[ui] Stage content crashed', e)}
-	             fallback={({ reset }) => (
+	             fallback={({ reset, error }) => (
 	               <div className="w-full h-full flex flex-col items-center justify-center py-20 text-slate-300">
 	                 <div className="text-lg font-bold text-white">{t('render_error_title')}</div>
 	                 <div className="mt-2 text-sm text-slate-400 text-center max-w-md">
 	                   {t('render_error_desc')}
 	                 </div>
+	                 {error ? (
+	                   <pre className="mt-4 max-w-3xl text-xs text-rose-200/90 bg-rose-950/30 border border-rose-900/40 rounded-xl p-3 whitespace-pre-wrap break-words">
+	                     {typeof error === 'string' ? error : (error as any)?.message || String(error)}
+	                   </pre>
+	                 ) : null}
 	                 <button
 	                   type="button"
 	                   onClick={reset}
@@ -645,39 +719,45 @@ function App() {
 
       {/* Modals */}
       {selectedMedia && (
-        <MediaDetailModal 
-          item={selectedMedia} 
-          onClose={() => setSelectedMedia(null)} 
-          onPlay={handlePlay}
-          isAdmin={!!currentUser?.isManager}
-          onManualMappingSaved={(id) => refreshMediaItem(id)}
-          profileId={currentUser?.id}
-          onListChanged={() => {
-            if (currentView === 'list') void refreshUserList(currentUser);
-          }}
-        />
+        <Suspense fallback={<div className="fixed inset-0 z-[190] bg-black/50 backdrop-blur-sm" />}>
+          <MediaDetailModal 
+            item={selectedMedia} 
+            onClose={() => setSelectedMedia(null)} 
+            onPlay={handlePlay}
+            isAdmin={!!currentUser?.isManager}
+            onManualMappingSaved={(id) => refreshMediaItem(id)}
+            profileId={currentUser?.id}
+            onListChanged={() => {
+              if (currentView === 'list') void refreshUserList(currentUser);
+            }}
+          />
+        </Suspense>
       )}
 
       {playingMedia && (
-        <VideoPlayer 
-          src={playingSrc || ''} 
-          title={playingMedia.title}
-          nowPlayingLabel={nowPlayingLabel || undefined}
-          onPrevItem={hasPrevItem ? handlePrevPlayingItem : undefined}
-          onNextItem={hasNextItem ? handleNextPlayingItem : undefined}
-          hasPrevItem={hasPrevItem}
-          hasNextItem={hasNextItem}
-          episodeSeasons={playerSeasons.map(s => ({ key: s.key, label: s.label, episodes: s.episodes }))}
-          currentPath={playingMedia.path}
-          onSelectEpisode={handleSelectEpisode}
-          nextSeriesTitle={(playingMedia as any)?.nextSeries?.title || undefined}
-          onContinueNextSeries={
-            (playingMedia as any)?.nextSeries?.id
-              ? () => handleContinueNextSeries(Number((playingMedia as any).nextSeries.id))
-              : undefined
-          }
-          onClose={closePlayer}
-        />
+        <Suspense fallback={<div className="fixed inset-0 z-[210] bg-black" />}>
+          <VideoPlayer 
+            src={playingSrc || ''} 
+            title={playingMedia.title}
+            nowPlayingLabel={nowPlayingLabel || undefined}
+            startTime={playingStartTime || 0}
+            onProgressUpdate={handleProgressUpdate}
+            onPrevItem={hasPrevItem ? handlePrevPlayingItem : undefined}
+            onNextItem={hasNextItem ? handleNextPlayingItem : undefined}
+            hasPrevItem={hasPrevItem}
+            hasNextItem={hasNextItem}
+            episodeSeasons={playerSeasons.map(s => ({ key: s.key, label: s.label, episodes: s.episodes }))}
+            currentPath={playingMedia.path}
+            onSelectEpisode={handleSelectEpisode}
+            nextSeriesTitle={(playingMedia as any)?.nextSeries?.title || undefined}
+            onContinueNextSeries={
+              (playingMedia as any)?.nextSeries?.id
+                ? () => handleContinueNextSeries(Number((playingMedia as any).nextSeries.id))
+                : undefined
+            }
+            onClose={closePlayer}
+          />
+        </Suspense>
       )}
     </div>
   );

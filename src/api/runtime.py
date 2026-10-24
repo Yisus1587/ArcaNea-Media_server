@@ -8,22 +8,28 @@ from typing import Iterable
 
 from sqlalchemy.orm import Session
 
-from ..db import SessionLocal, models
-from ..scanner.scanner import Scanner
-from ..services.enrichment_runner import enrich_one_serialized
-from ..services.scan_state import set_state as set_scan_state
-from ..utils.path_hash import hash_path
+try:
+    from ..db import SessionLocal, models
+except ImportError:  # pragma: no cover
+    try:
+        from src.db import SessionLocal, models  # type: ignore
+    except Exception:
+        from db import SessionLocal, models  # type: ignore
+from ..services import media_pipeline as scan_service
+try:
+    from ..services.scan_state import set_state as set_scan_state, get_state as get_scan_state
+except ImportError:  # pragma: no cover
+    try:
+        from src.services.scan_state import set_state as set_scan_state, get_state as get_scan_state  # type: ignore
+    except Exception:
+        from services.scan_state import set_state as set_scan_state, get_state as get_scan_state  # type: ignore
 
 _watcher_service = None
 _watcher_queue: _queue.Queue | None = None
 _watcher_worker_thread: threading.Thread | None = None
+
 _watcher_stop = threading.Event()
 _watcher_pause = threading.Event()
-_watcher_last_enrich: dict[int, float] = {}
-try:
-    _WATCHER_ENRICH_DEBOUNCE_SEC = float(__import__("os").environ.get("ARCANEA_WATCH_ENRICH_DEBOUNCE_SEC", "5") or 5)
-except Exception:
-    _WATCHER_ENRICH_DEBOUNCE_SEC = 5.0
 
 
 def watcher_is_paused() -> bool:
@@ -109,47 +115,8 @@ def watcher_start_if_enabled() -> None:
     _watcher_service = WatchService(out_queue=_watcher_queue)
     _watcher_service.start()
 
-    def _cleanup_missing_paths(paths: Iterable[str]) -> None:
-        log = logging.getLogger(__name__)
-        db = SessionLocal()
-        try:
-            for p in paths:
-                try:
-                    fr = db.query(models.FileRecord).filter(models.FileRecord.path == str(p)).first()
-                    if not fr:
-                        continue
-                    mid = getattr(fr, "media_item_id", None)
-                    try:
-                        db.delete(fr)
-                        db.flush()
-                    except Exception:
-                        db.rollback()
-                        continue
-
-                    if mid:
-                        remaining = db.query(models.FileRecord.id).filter(models.FileRecord.media_item_id == mid).first()
-                        if not remaining:
-                            db.query(models.MediaMetadata).filter(models.MediaMetadata.media_item_id == mid).delete(
-                                synchronize_session=False
-                            )
-                            db.query(models.MediaImage).filter(models.MediaImage.media_item_id == mid).delete(
-                                synchronize_session=False
-                            )
-                            db.query(models.MediaItem).filter(models.MediaItem.id == mid).delete(
-                                synchronize_session=False
-                            )
-                except Exception:
-                    log.exception("Failed cleanup for missing path %s", p)
-            db.commit()
-        except Exception:
-            db.rollback()
-            log.exception("Missing-path cleanup failed")
-        finally:
-            db.close()
-
     def _watcher_worker() -> None:
         log = logging.getLogger(__name__)
-        scanner = Scanner()
         while not _watcher_stop.is_set():
             while _watcher_pause.is_set() and not _watcher_stop.is_set():
                 time.sleep(0.25)
@@ -159,70 +126,17 @@ def watcher_start_if_enabled() -> None:
                 continue
             if item is None:
                 break
-            if isinstance(item, dict) and item.get("action") == "missing_batch":
-                paths = item.get("paths") or []
-                if isinstance(paths, list) and paths:
-                    _cleanup_missing_paths(paths)
-                continue
             try:
-                # Refresh roots before each scan.
+                if isinstance(item, dict):
+                    result = scan_service.handle_watch_event(item)
+                    state_path = item.get("path") or item.get("dest_path") or item.get("src_path") or item.get("action")
+                else:
+                    result = scan_service.handle_watch_event({"action": "changed", "path": str(item)})
+                    state_path = str(item)
                 try:
-                    if _watcher_service is not None and getattr(_watcher_service, "roots", None):
-                        from pathlib import Path as _Path
-
-                        scanner.roots = [_Path(r).resolve() for r in list(getattr(_watcher_service, "roots", [])) if r]
+                    set_scan_state({"watch": {"path": str(state_path), "result": result, "ts": int(time.time())}})
                 except Exception:
                     pass
-                scanner.scan_path(str(item))
-                try:
-                    set_scan_state({"watch": {"path": str(item), "ts": int(time.time())}})
-                except Exception:
-                    pass
-                try:
-                    from pathlib import Path as _Path
-
-                    resolved = None
-                    try:
-                        resolved = str(_Path(str(item)).resolve())
-                    except Exception:
-                        resolved = str(item)
-
-                    mid = None
-                    dbx = SessionLocal()
-                    try:
-                        if resolved:
-                            fr = dbx.query(models.FileRecord).filter(models.FileRecord.path == resolved).first()
-                        else:
-                            fr = None
-                        if fr and getattr(fr, "media_item_id", None):
-                            try:
-                                mid = int(getattr(fr, "media_item_id"))
-                            except Exception:
-                                mid = None
-                        if mid is None and resolved:
-                            mi = dbx.query(models.MediaItem).filter(models.MediaItem.canonical_path == resolved).first()
-                            if not mi and resolved:
-                                h = hash_path(resolved)
-                                if h:
-                                    mi = dbx.query(models.MediaItem).filter(models.MediaItem.canonical_path_hash == h).first()
-                            if mi is not None:
-                                try:
-                                    mid = int(getattr(mi, "id"))
-                                except Exception:
-                                    mid = None
-                    finally:
-                        dbx.close()
-                    if mid is not None:
-                        now = time.time()
-                        last = _watcher_last_enrich.get(mid, 0.0)
-                        if (now - last) >= _WATCHER_ENRICH_DEBOUNCE_SEC:
-                            _watcher_last_enrich[mid] = now
-                            try:
-                                enrich_one_serialized(mid)
-                            except Exception:
-                                log.exception("Watcher per-item enrich failed for %s", mid)
-                except Exception:
-                    log.exception("Watcher per-item enrich lookup failed for %s", item)
             except Exception:
                 log.exception("Watcher worker failed for %s", item)
 

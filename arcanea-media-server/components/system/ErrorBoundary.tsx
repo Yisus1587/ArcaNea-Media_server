@@ -1,4 +1,4 @@
-import React from 'react';
+import * as React from 'react';
 
 type FallbackRender = (args: { error: unknown; reset: () => void }) => React.ReactNode;
 
@@ -16,7 +16,18 @@ type ErrorBoundaryState = {
 };
 
 export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundaryState> {
-  state: ErrorBoundaryState = { error: null, resetKey: this.props.resetKey };
+  // NOTE: Some React type setups (React 19 + bundler resolution) can end up
+  // losing inherited instance members during typechecking. Declaring these
+  // keeps TS happy without changing runtime behavior.
+  declare props: Readonly<ErrorBoundaryProps>;
+  declare setState: React.Component<ErrorBoundaryProps, ErrorBoundaryState>['setState'];
+
+  state: ErrorBoundaryState;
+
+  constructor(props: ErrorBoundaryProps) {
+    super(props);
+    this.state = { error: null, resetKey: props.resetKey };
+  }
 
   static getDerivedStateFromError(error: unknown): Partial<ErrorBoundaryState> {
     return { error };
@@ -52,4 +63,3 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
     return this.props.children;
   }
 }
-

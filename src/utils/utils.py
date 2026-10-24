@@ -2,6 +2,7 @@ import os
 import re
 import logging
 import queue
+import unicodedata
 from typing import Optional, List, Any
 from pathlib import Path
 import posixpath
@@ -11,6 +12,71 @@ from src.core.network import session
 from src.core.config import config
 
 # Utilities for filenames, text and images
+
+MOVIE_TITLE_ALIASES = {
+    "3 john wick parabelllum": ["John Wick Chapter 3 Parabellum", "John Wick 3 Parabellum"],
+    "agente 007 el manana nunca muere": ["Tomorrow Never Dies"],
+    "blade 2": ["https://www.themoviedb.org/movie/36586", "Blade II"],
+    "blade 3": ["https://www.themoviedb.org/movie/36648", "Blade Trinity"],
+    "contactos de cuarto tipo": ["The Fourth Kind"],
+    "dragon ball z broly el legendario super saiyajin": ["https://www.themoviedb.org/movie/34433", "Dragon Ball Z Broly The Legendary Super Saiyan"],
+    "dragon ball z la batalla mas grande de este mundo esta por comenzar": ["Dragon Ball Z The World's Strongest"],
+    "2012": ["https://www.themoviedb.org/movie/14161"],
+    "el codigo da vinci 2 angeles y demonios": ["https://www.themoviedb.org/movie/13448", "Angels & Demons"],
+    "el codigo da vinci 3 inferno": ["https://www.themoviedb.org/movie/207932", "Inferno 2016"],
+    "el final de todo": ["How It Ends 2018"],
+    "el juego de ender": ["Ender's Game"],
+    "el nino que domo el viento": ["The Boy Who Harnessed the Wind"],
+    "estacion zombie 2": ["Train to Busan Peninsula", "Peninsula 2020"],
+    "exterminio 1 28 dias despues": ["28 Days Later 2002"],
+    "exterminio 2 28 semanas despues": ["28 Weeks Later 2007"],
+    "guerra mundial z": ["World War Z"],
+    "hombres de negro": ["Men in Black"],
+    "hombres de negro 2": ["https://www.themoviedb.org/movie/608", "Men in Black II"],
+    "hombres de negro 3": ["https://www.themoviedb.org/movie/41154", "Men in Black 3"],
+    "hombres de negro 4": ["https://www.themoviedb.org/movie/479455", "Men in Black International"],
+    "jocker 2": ["https://www.themoviedb.org/movie/889737", "Joker Folie a Deux"],
+    "iron man": ["https://www.themoviedb.org/movie/1726"],
+    "iron man 2": ["https://www.themoviedb.org/movie/10138"],
+    "iron man 3": ["https://www.themoviedb.org/movie/68721"],
+    "la guerra de manana": ["The Tomorrow War"],
+    "las guerreras k pop": ["KPop Demon Hunters"],
+    "legion de angeles": ["Legion 2010"],
+    "los pinguinos de madagascar": ["https://www.themoviedb.org/movie/270946", "Penguins of Madagascar 2014"],
+    "los pinguinos de madascar": ["https://www.themoviedb.org/movie/270946", "Penguins of Madagascar 2014"],
+    "los pitufos": ["The Smurfs 2011"],
+    "los vengadores infinity wars": ["Avengers Infinity War"],
+    "los vengadores endgame": ["https://www.themoviedb.org/movie/299534", "Avengers Endgame"],
+    "maquina de guerra": ["War Machine 2017"],
+    "piratas del caribe la maldicion de la perla negra": ["Pirates of the Caribbean The Curse of the Black Pearl"],
+    "rec 2": ["https://www.themoviedb.org/movie/10664", "REC 2 2009"],
+    "robocop": ["https://www.themoviedb.org/movie/5548"],
+    "robocop 2014": ["https://www.themoviedb.org/movie/97020"],
+    "robocop 2": ["https://www.themoviedb.org/movie/5549"],
+    "robocop 3": ["https://www.themoviedb.org/movie/5550"],
+    "shrek 2": ["https://www.themoviedb.org/movie/809"],
+    "shrek 3": ["https://www.themoviedb.org/movie/810"],
+    "shrek 4 para siempre": ["Shrek Forever After"],
+    "son como ninos 2": ["Grown Ups 2"],
+    "terremoto la falla de san andres": ["San Andreas 2015"],
+    "titanes del pacifico 2": ["https://www.themoviedb.org/movie/268896", "Pacific Rim Uprising"],
+    "titanes de pacifico": ["Pacific Rim"],
+    "halo 4 forward unto dawn": ["https://www.themoviedb.org/tv/56295", "Halo 4 Forward Unto Dawn", "Halo 4: Forward Unto Dawn"],
+    "halo the fall of reach": ["https://www.themoviedb.org/tv/77184", "Halo The Fall of Reach", "Halo: The Fall of Reach"],
+    "resident evil bienvenidos a raccoon city": ["Resident Evil Welcome to Raccoon City"],
+}
+
+
+def _alias_key(value: str | None) -> str:
+    try:
+        text = unicodedata.normalize("NFKD", str(value or ""))
+        text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    except Exception:
+        text = str(value or "")
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    return text
 
 
 def limpiar_nombre_archivo(nombre: str) -> str:
@@ -98,7 +164,7 @@ def resumir_texto(texto: str, max_len: int = 250) -> str:
 
 def descargar_imagen(url: str, ruta_destino: str) -> bool:
     try:
-        response = session.get(url, timeout=10)
+        response = session.get(url, timeout=10)  #type: ignore
         response.raise_for_status()
         if "image" not in response.headers.get("Content-Type", ""):
             return False
@@ -229,25 +295,80 @@ def normalize_folder_name_for_search(name: str):
     if not name:
         return [""]
     s = name
+    try:
+        s = str(s).translate(str.maketrans({"²": "2", "³": "3", "¹": "1"}))
+    except Exception:
+        pass
+    year_candidates: list[str] = []
+    try:
+        year_candidates.extend(re.findall(r"\b(?:19|20)\d{2}\b", s))
+    except Exception:
+        pass
+    try:
+        for m in re.finditer(r"[\(\[]([^\)\]]+)[\)\]]", s):
+            try:
+                inner = m.group(1) or ""
+            except Exception:
+                inner = ""
+            if not inner:
+                continue
+            try:
+                year_candidates.extend(re.findall(r"\b(?:19|20)\d{2}\b", inner))
+            except Exception:
+                pass
+    except Exception:
+        pass
     # remove file extensions if present
     s = re.sub(r"\.[a-zA-Z0-9]{1,4}$", "", s)
     # replace separators with spaces
     s = re.sub(r'[\._\-]+', ' ', s)
+    # Preserve leading title tokens like "[REC]²"; remove other bracket noise.
+    try:
+        s = re.sub(r"^\[([A-Za-z][A-Za-z0-9 ]{1,24})\]", r"\1 ", s)
+    except Exception:
+        pass
     # remove bracketed content [..], (..), {..}
     s = re.sub(r"\[.*?\]|\(.*?\)|\{.*?\}", "", s)
     # remove common tags like resolutions, codecs, languages, release tags
-    tags_rx = r"\b(480p|720p|1080p|2160p|4k|8k|x264|x265|h264|h265|hevc|bdrip|bluray|bdrip|web[- ]?dl|webdl|web|dvd|dvdrip|amzn|mp4|mkv|aac|flac|eng|esp|sub|subbed|dubbed|dub)\b"
+    tags_rx = r"\b(480p|720p|1080p|2160p|4k|8k|480|720|1080|2160|x264|x265|h264|h265|hevc|bdrip|bluray|bdrip|web[- ]?dl|webdl|webrip|hdrip|hdr|dvdscr|cam|ts|telesync|web|dvd|dvdrip|amzn|hd|online|mp4|mkv|aac|flac|eng|esp|spa|es|en|lat|latino|castellano|espanol|espa\u00f1ol|sub|subbed|dubbed|dub|dual|multi|lat[- ]?eng|capitulo|cap\u00edtulo|cap|chapter|parte|pelicula|pel\u00edcula)\b"
     s = re.sub(tags_rx, '', s, flags=re.IGNORECASE)
+    # remove social/channel tags like "@StreamingLatino"
+    s = re.sub(r"(?i)\B@\w+\b", " ", s)
     # remove leftover multiple spaces
     s = re.sub(r'\s{2,}', ' ', s).strip()
 
     candidates = []
     if s:
         candidates.append(s)
+    # If name starts with a small leading number (e.g. "1 John Wick"), add variants.
+    try:
+        m_lead = re.match(r"^\s*(\d{1,2})\s+(.+)$", s)
+        if m_lead:
+            num = int(m_lead.group(1))
+            rest = (m_lead.group(2) or "").strip()
+            if rest:
+                if rest not in candidates:
+                    candidates.append(rest)
+                with_num = f"{rest} {num}".strip()
+                if with_num and with_num not in candidates:
+                    candidates.append(with_num)
+    except Exception:
+        pass
     # variant without year
     s_no_year = re.sub(r"\b(19|20)\d{2}\b", '', s).strip()
     if s_no_year and s_no_year != s:
         candidates.append(s_no_year)
+    # variant with explicit year (if it existed in original text)
+    try:
+        if year_candidates:
+            y = year_candidates[0]
+            if y:
+                if not re.search(rf"\b{re.escape(y)}\b", s):
+                    with_year = f"{s} {y}".strip()
+                    if with_year and with_year not in candidates:
+                        candidates.append(with_year)
+    except Exception:
+        pass
     # detect roman numerals used as season suffixes (I, II, III, IV, V, VI...)
     roman_rx = re.compile(r"\b(M{0,3})(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})\b", re.IGNORECASE)
     # common short season tokens (also handle "Part 2", "Cour 2", and specials folders)
@@ -339,6 +460,49 @@ def normalize_folder_name_for_search(name: str):
             with_season = f"{without_roman} Season {num}" if without_roman else f"Season {num}"
             if with_season and with_season not in candidates:
                 candidates.append(with_season)
+    try:
+        existing_alias = {str(x).strip().lower() for x in candidates if str(x or "").strip()}
+        keys = {_alias_key(s)}
+        try:
+            no_year_key = _alias_key(re.sub(r"\b(?:19|20)\d{2}\b", " ", s))
+            if no_year_key:
+                keys.add(no_year_key)
+        except Exception:
+            pass
+        try:
+            for y in year_candidates:
+                year_key = _alias_key(f"{s} {y}")
+                if year_key:
+                    keys.add(year_key)
+        except Exception:
+            pass
+        for key in sorted(keys, key=len, reverse=True):
+            aliases = MOVIE_TITLE_ALIASES.get(key)
+            if not aliases:
+                for alias_key, alias_values in sorted(MOVIE_TITLE_ALIASES.items(), key=lambda item: len(item[0]), reverse=True):
+                    if key.startswith(alias_key + " "):
+                        aliases = alias_values
+                        break
+            if not aliases:
+                continue
+            for alias in aliases:
+                alias_s = str(alias or "").strip()
+                if alias_s and alias_s.lower() not in existing_alias:
+                    alias_l = alias_s.lower()
+                    if alias_s.isdigit() or "themoviedb.org/" in alias_l:
+                        insert_at = 0
+                        while insert_at < len(candidates):
+                            existing_c = str(candidates[insert_at] or "").strip()
+                            existing_l = existing_c.lower()
+                            if not (existing_c.isdigit() or "themoviedb.org/" in existing_l):
+                                break
+                            insert_at += 1
+                        candidates.insert(insert_at, alias_s)
+                    else:
+                        candidates.append(alias_s)
+                    existing_alias.add(alias_l)
+    except Exception:
+        pass
     # ensure uniqueness and strip
     seen = set()
     out = []

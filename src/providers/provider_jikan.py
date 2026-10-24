@@ -5,18 +5,34 @@ import logging
 import time
 import os
 import re
+try:
+    from src.services import telemetry  # type: ignore
+except Exception:
+    try:
+        from ..services import telemetry  # type: ignore
+    except Exception:
+        telemetry = None
 
 # Prefer project cache utilities but fall back gracefully
 try:
-    from src.tools.cache import cache_get, cache_set
+    from src.tools.cache import cache_get, cache_set, cache_get_negative, cache_set_negative
 except Exception:
     try:
-        from src.tools.cache import cache_get, cache_set
+        from src.tools.cache import cache_get, cache_set, cache_get_negative, cache_set_negative
     except Exception:
         def cache_get(key):
             return None
         def cache_set(key, value):
             return None
+        def cache_get_negative(key):
+            return None
+        def cache_set_negative(key, value=True):
+            return None
+try:
+    from src.utils.rate_limiter import get_limiter
+    _rate_limiter = get_limiter("jikan")
+except Exception:
+    _rate_limiter = None
 
 API_BASE = "https://api.jikan.moe/v4"
 
@@ -34,16 +50,16 @@ def _throttle_acquire():
     try:
         if _api_sema:
             _api_sema.acquire()
-    except Exception:
-        pass
-
+    except Exception as e:
+        _debug_suppressed(e)
 def _throttle_release():
     try:
         if _api_sema:
             _api_sema.release()
-    except Exception:
-        pass
-    if _API_DELAY_SEC > 0:
+    except Exception as e:
+        _debug_suppressed(e)
+    # When rate limiter is active, avoid double-throttling here.
+    if _API_DELAY_SEC > 0 and _rate_limiter is None:
         time.sleep(_API_DELAY_SEC)
 
 # Simple circuit breaker to avoid hammering Jikan when it's returning 429/504.
@@ -69,8 +85,8 @@ def create_session_with_retries(total_retries=3, backoff_factor=0.5, status_forc
             hsp = str(os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or "").strip().lower()
             if hp.startswith("http://127.0.0.1:9") or hsp.startswith("http://127.0.0.1:9"):
                 session.trust_env = False
-    except Exception:
-        pass
+    except Exception as e:
+        _debug_suppressed(e)
     retries = Retry(total=total_retries, backoff_factor=backoff_factor, status_forcelist=status_forcelist, allowed_methods=frozenset(['GET','POST']))
     adapter = HTTPAdapter(max_retries=retries)
     session.mount('http://', adapter)
@@ -80,6 +96,65 @@ def create_session_with_retries(total_retries=3, backoff_factor=0.5, status_forc
 
 session = create_session_with_retries()
 logger = logging.getLogger(__name__)
+
+# Lightweight provider health cache to avoid spamming the API with pings.
+_health_cache = {"ts": 0.0, "ok": True, "status": None}
+
+
+def _debug_suppressed(exc: Exception) -> None:
+    try:
+        logger.debug("provider_jikan: suppressed exception: %s", exc)
+    except Exception:
+        return
+
+
+def healthcheck(timeout_s: float = 3.0, ttl_s: float = 20.0) -> dict:
+    """Best-effort healthcheck for Jikan.
+
+    Returns: {"ok": bool, "status_code": int|None, "detail": str|None}
+
+    We intentionally treat any response < 500 as "ok" (including 404) because the
+    goal is to detect server-side outages (5xx) quickly during auto-fallback flows.
+    """
+    try:
+        now = time.time()
+        try:
+            ts = float(_health_cache.get("ts") or 0.0)
+        except Exception:
+            ts = 0.0
+        if (now - ts) < float(ttl_s):
+            return {
+                "ok": bool(_health_cache.get("ok", True)),
+                "status_code": _health_cache.get("status"),
+                "detail": None,
+                "cached": True,
+            }
+    except Exception:
+        pass
+
+    status_code = None
+    ok = False
+    detail = None
+    try:
+        # Use a stable, cheap endpoint (MAL id 1 exists). We only care about 5xx vs non-5xx.
+        resp = session.get(f"{API_BASE}/anime/1", timeout=float(timeout_s))
+        status_code = getattr(resp, "status_code", None)
+        try:
+            ok = bool(status_code is not None and int(status_code) < 500)
+        except Exception:
+            ok = False
+    except Exception as e:
+        ok = False
+        detail = f"{type(e).__name__}: {e}"
+
+    try:
+        _health_cache["ts"] = time.time()
+        _health_cache["ok"] = bool(ok)
+        _health_cache["status"] = status_code
+    except Exception:
+        pass
+
+    return {"ok": bool(ok), "status_code": status_code, "detail": detail, "cached": False}
 
 
 def find_local_mal_id(folder_path):
@@ -123,48 +198,127 @@ def fetch_anime_by_id(mal_id):
     full endpoint is unavailable or fails.
     """
     last_error = None
+    cache_key = f"jikan:anime:{mal_id}"
+    try:
+        if cache_get_negative(cache_key):
+            return None
+    except Exception as e:
+        _debug_suppressed(e)
     # Prefer the /full endpoint to retrieve as much metadata as possible in one request.
     try:
         resp = None
         _throttle_acquire()
         try:
+            status_code = None
+            try:
+                if _rate_limiter is not None:
+                    _rate_limiter.before_request()
+            except Exception as e:
+                _debug_suppressed(e)
+            t0 = time.perf_counter()
             resp = session.get(f"{API_BASE}/anime/{mal_id}/full", timeout=10)
+            status_code = getattr(resp, "status_code", None)
             if resp.status_code == 404:
+                try:
+                    cache_set_negative(cache_key, True)
+                except Exception as e:
+                    _debug_suppressed(e)
+                try:
+                    if _rate_limiter is not None:
+                        _rate_limiter.record_failure(status_code=404)
+                except Exception as e:
+                    _debug_suppressed(e)
                 return None
             resp.raise_for_status()
             data = resp.json()
             if data and data.get('data'):
+                try:
+                    if _rate_limiter is not None:
+                        _rate_limiter.record_success(latency_ms=(time.perf_counter() - t0) * 1000.0)
+                except Exception as e:
+                    _debug_suppressed(e)
                 return data['data']
+            try:
+                cache_set_negative(cache_key, True)
+            except Exception as e:
+                _debug_suppressed(e)
         finally:
             try:
+                try:
+                    if telemetry is not None:
+                        dt = (time.perf_counter() - t0) * 1000.0 if 't0' in locals() else 0.0
+                        telemetry.emit_api_timing("jikan", f"/anime/{mal_id}/full", dt, status_code=status_code)
+                except Exception as e:
+                    _debug_suppressed(e)
                 if resp is not None:
                     resp.close()
-            except Exception:
-                pass
+            except Exception as e:
+                _debug_suppressed(e)
             _throttle_release()
     except Exception as e:
+        try:
+            if _rate_limiter is not None:
+                _rate_limiter.record_failure(status_code=getattr(resp, "status_code", None) if "resp" in locals() else None, exc=e)
+        except Exception as e:
+            _debug_suppressed(e)
         last_error = e
-
     # Fallback to the standard endpoint
     try:
         resp = None
         _throttle_acquire()
         try:
+            status_code = None
+            try:
+                if _rate_limiter is not None:
+                    _rate_limiter.before_request()
+            except Exception as e:
+                _debug_suppressed(e)
+            t0 = time.perf_counter()
             resp = session.get(f"{API_BASE}/anime/{mal_id}/", timeout=10)
+            status_code = getattr(resp, "status_code", None)
             if resp.status_code == 404:
+                try:
+                    cache_set_negative(cache_key, True)
+                except Exception as e:
+                    _debug_suppressed(e)
+                try:
+                    if _rate_limiter is not None:
+                        _rate_limiter.record_failure(status_code=404)
+                except Exception as e:
+                    _debug_suppressed(e)
                 return None
             resp.raise_for_status()
             data = resp.json()
             if data and data.get('data'):
+                try:
+                    if _rate_limiter is not None:
+                        _rate_limiter.record_success(latency_ms=(time.perf_counter() - t0) * 1000.0)
+                except Exception as e:
+                    _debug_suppressed(e)
                 return data['data']
+            try:
+                cache_set_negative(cache_key, True)
+            except Exception as e:
+                _debug_suppressed(e)
         finally:
             try:
+                try:
+                    if telemetry is not None:
+                        dt = (time.perf_counter() - t0) * 1000.0 if 't0' in locals() else 0.0
+                        telemetry.emit_api_timing("jikan", f"/anime/{mal_id}", dt, status_code=status_code)
+                except Exception as e:
+                    _debug_suppressed(e)
                 if resp is not None:
                     resp.close()
-            except Exception:
-                pass
+            except Exception as e:
+                _debug_suppressed(e)
             _throttle_release()
     except Exception as e:
+        try:
+            if _rate_limiter is not None:
+                _rate_limiter.record_failure(status_code=getattr(resp, "status_code", None) if "resp" in locals() else None, exc=e)
+        except Exception as e:
+            _debug_suppressed(e)
         last_error = e
 
     if last_error is not None:
@@ -279,6 +433,11 @@ def obtener_episodios(anime_id):
                     response = None
                     _throttle_acquire()
                     try:
+                        try:
+                            if _rate_limiter is not None:
+                                _rate_limiter.before_request()
+                        except Exception as e:
+                            _debug_suppressed(e)
                         response = session.get(f"{API_BASE}/anime/{anime_id}/episodes", params={"page": page}, timeout=15)
                         # Handle explicit 429 with Retry-After
                         if response.status_code == 429:
@@ -293,18 +452,33 @@ def obtener_episodios(anime_id):
                             logging.warning("provider_jikan.obtener_episodios: rate limited on page %s for %s, sleeping %s seconds", page, anime_id, wait)
                             time.sleep(wait)
                             attempt += 1
+                            try:
+                                if _rate_limiter is not None:
+                                    _rate_limiter.record_failure(status_code=429)
+                            except Exception as e:
+                                _debug_suppressed(e)
                             continue
                         response.raise_for_status()
                         data = response.json()
+                        try:
+                            if _rate_limiter is not None:
+                                _rate_limiter.record_success()
+                        except Exception as e:
+                            _debug_suppressed(e)
                         break
                     finally:
                         try:
                             if response is not None:
                                 response.close()
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            _debug_suppressed(e)
                         _throttle_release()
                 except Exception as e:
+                    try:
+                        if _rate_limiter is not None:
+                            _rate_limiter.record_failure(exc=e)
+                    except Exception as e:
+                        _debug_suppressed(e)
                     logging.debug("provider_jikan.obtener_episodios: transient error fetching page %s for %s: %s", page, anime_id, e)
                     attempt += 1
                     time.sleep(min(2 ** attempt, 10))
@@ -356,6 +530,122 @@ def obtener_episodios(anime_id):
     return episodios
 
 
+def obtener_episodio_detalle(anime_id, episode_number):
+    """Fetch detailed episode info for an anime episode number.
+
+    Jikan's `/anime/{id}/episodes` listing does not always include synopsis/summary.
+    This endpoint can provide additional details (best-effort, rate-limited).
+    """
+    try:
+        aid = str(anime_id).strip()
+    except Exception:
+        aid = ""
+    if not aid:
+        return None
+    try:
+        en = int(episode_number)
+    except Exception:
+        return None
+    if en <= 0:
+        return None
+
+    cache_key = f"episodes:jikan:{aid}:detail:{en}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        if cache_get_negative(cache_key):
+            return None
+    except Exception as e:
+        _debug_suppressed(e)
+
+    last_error = None
+    for attempt in range(4):
+        resp = None
+        try:
+            _throttle_acquire()
+            try:
+                try:
+                    if _rate_limiter is not None:
+                        _rate_limiter.before_request()
+                except Exception as e:
+                    _debug_suppressed(e)
+
+                t0 = time.perf_counter()
+                resp = session.get(f"{API_BASE}/anime/{aid}/episodes/{en}", timeout=12)
+                status_code = getattr(resp, "status_code", None)
+                if status_code == 404:
+                    try:
+                        cache_set_negative(cache_key, True)
+                    except Exception as e:
+                        _debug_suppressed(e)
+                    try:
+                        if _rate_limiter is not None:
+                            _rate_limiter.record_failure(status_code=404)
+                    except Exception as e:
+                        _debug_suppressed(e)
+                    return None
+                if status_code == 429:
+                    ra = resp.headers.get("Retry-After")
+                    try:
+                        wait = int(ra) if ra is not None else min(2 ** attempt, 10)
+                    except Exception:
+                        wait = min(2 ** attempt, 10)
+                    time.sleep(wait)
+                    try:
+                        if _rate_limiter is not None:
+                            _rate_limiter.record_failure(status_code=429)
+                    except Exception as e:
+                        _debug_suppressed(e)
+                    continue
+                resp.raise_for_status()
+                data = resp.json() if resp.content else {}
+                out = data.get("data") if isinstance(data, dict) else None
+                if isinstance(out, dict) and out:
+                    try:
+                        cache_set(cache_key, out)
+                    except Exception as e:
+                        _debug_suppressed(e)
+                    try:
+                        if _rate_limiter is not None:
+                            _rate_limiter.record_success(latency_ms=(time.perf_counter() - t0) * 1000.0)
+                    except Exception as e:
+                        _debug_suppressed(e)
+                    return out
+                try:
+                    cache_set_negative(cache_key, True)
+                except Exception as e:
+                    _debug_suppressed(e)
+                return None
+            finally:
+                try:
+                    if telemetry is not None:
+                        dt = (time.perf_counter() - t0) * 1000.0 if "t0" in locals() else 0.0
+                        telemetry.emit_api_timing("jikan", f"/anime/{aid}/episodes/{en}", dt, status_code=status_code if "status_code" in locals() else None)
+                except Exception as e:
+                    _debug_suppressed(e)
+                try:
+                    if resp is not None:
+                        resp.close()
+                except Exception as e:
+                    _debug_suppressed(e)
+                _throttle_release()
+        except Exception as e:
+            last_error = e
+            try:
+                if _rate_limiter is not None:
+                    _rate_limiter.record_failure(status_code=getattr(resp, "status_code", None) if resp is not None else None, exc=e)
+            except Exception as e:
+                _debug_suppressed(e)
+            time.sleep(min(2 ** (attempt + 1), 10))
+            continue
+
+    if last_error is not None:
+        logging.debug("provider_jikan.obtener_episodio_detalle: failed for %s ep=%s: %s", aid, en, last_error)
+    return None
+
+
 def buscar_anime_candidates(titulo, limit_per_variant=8, overall_limit=20):
     """Return a list of candidate anime result dicts from Jikan for the given folder name/title."""
     from src.utils.utils import normalize_folder_name_for_search
@@ -370,15 +660,25 @@ def buscar_anime_candidates(titulo, limit_per_variant=8, overall_limit=20):
                 resp = None
                 _throttle_acquire()
                 try:
+                    try:
+                        if _rate_limiter is not None:
+                            _rate_limiter.before_request()
+                    except Exception as e:
+                        _debug_suppressed(e)
                     resp = session.get(f"{API_BASE}/anime", params={"q": v, "limit": limit_per_variant}, timeout=10)
                     resp.raise_for_status()
                     data = resp.json()
+                    try:
+                        if _rate_limiter is not None:
+                            _rate_limiter.record_success()
+                    except Exception as e:
+                        _debug_suppressed(e)
                 finally:
                     try:
                         if resp is not None:
                             resp.close()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        _debug_suppressed(e)
                     _throttle_release()
                 results = data.get("data") or []
                 for r in results:
@@ -388,10 +688,15 @@ def buscar_anime_candidates(titulo, limit_per_variant=8, overall_limit=20):
                         seen_ids.add(mid)
                         if len(candidates) >= overall_limit:
                             return candidates
-            except Exception:
+            except Exception as e:
+                try:
+                    if _rate_limiter is not None:
+                        _rate_limiter.record_failure(exc=e)
+                except Exception as e:
+                    _debug_suppressed(e)
                 continue
-    except Exception:
-        pass
+    except Exception as e:
+        _debug_suppressed(e)
     return candidates
 
 
@@ -399,7 +704,14 @@ def buscar_anime_por_titulo_jikan(titulo):
     """Search Jikan by title (used when no local id is present). Returns best match or None."""
     global _cooldown_until_ts
     from src.utils.utils import normalize_folder_name_for_search
-    cache_key = f"search:jikan:{titulo}"
+    # Versioned cache key: scoring rules evolve (season detection, tokenization, etc.).
+    # Bumping the key prevents stale/wrong season matches from sticking for 1h TTL.
+    cache_key = f"search:jikan:v2:{titulo}"
+    try:
+        if cache_get_negative(cache_key):
+            return None
+    except Exception as e:
+        _debug_suppressed(e)
     cached = cache_get(cache_key)
     if cached:
         return cached
@@ -411,7 +723,16 @@ def buscar_anime_por_titulo_jikan(titulo):
         import re
         from difflib import SequenceMatcher
 
-        season_num_rx_local = re.compile(r"\bseason\s*(\d{1,2})\b|\btemporada\s*(\d{1,2})\b|\btemp(?:\.|orada)?\s*(\d{1,2})\b|\bs(\d{1,2})\b", re.IGNORECASE)
+        season_num_rx_local = re.compile(
+            r"\bseason\s*0*(\d{1,2})\b"
+            r"|\b0*(\d{1,2})(?:st|nd|rd|th)\s*season\b"
+            r"|\btemporada\s*0*(\d{1,2})\b"
+            r"|\b0*(\d{1,2})(?:a|ª|da|ra|ta)\s*temporada\b"
+            r"|\btemp(?:\.|orada)?\s*0*(\d{1,2})\b"
+            r"|\bs0*(\d{1,2})\b"
+            r"|\b(?!19\d{2}\b)(?!20\d{2}\b)0*(\d{1,2})\b\s*$",
+            re.IGNORECASE,
+        )
         roman_map_local = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7, "VIII": 8, "IX": 9, "X": 10}
 
         variants = normalize_folder_name_for_search(titulo)
@@ -440,19 +761,43 @@ def buscar_anime_por_titulo_jikan(titulo):
             response = None
             _throttle_acquire()
             try:
+                status_code = None
+                try:
+                    if _rate_limiter is not None:
+                        _rate_limiter.before_request()
+                except Exception as e:
+                    _debug_suppressed(e)
+                t0 = time.perf_counter()
                 response = session.get(f"{API_BASE}/anime", params={"q": q0, "limit": 25}, timeout=10)
+                status_code = getattr(response, "status_code", None)
                 response.raise_for_status()
                 data = response.json()
+                try:
+                    if _rate_limiter is not None:
+                        _rate_limiter.record_success(latency_ms=(time.perf_counter() - t0) * 1000.0)
+                except Exception as e:
+                    _debug_suppressed(e)
             finally:
                 try:
+                    try:
+                        if telemetry is not None:
+                            dt = (time.perf_counter() - t0) * 1000.0 if 't0' in locals() else 0.0
+                            telemetry.emit_api_timing("jikan", "/anime", dt, status_code=status_code)
+                    except Exception as e:
+                        _debug_suppressed(e)
                     if response is not None:
                         response.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    _debug_suppressed(e)
                 _throttle_release()
             results = data.get("data") or []
         except Exception as e:
             last_error = e
+            try:
+                if _rate_limiter is not None:
+                    _rate_limiter.record_failure(status_code=status_code if "status_code" in locals() else None, exc=e)
+            except Exception as e:
+                _debug_suppressed(e)
             # Trip cooldown on rate-limit / gateway issues to prevent immediate repeated failures.
             try:
                 import time as _time
@@ -469,12 +814,18 @@ def buscar_anime_por_titulo_jikan(titulo):
                             _cooldown_until_ts = max(_cooldown_until_ts, until)
                     else:
                         _cooldown_until_ts = max(_cooldown_until_ts, until)
-            except Exception:
-                pass
+            except Exception as e:
+                _debug_suppressed(e)
             raise
 
         if not results:
+            try:
+                cache_set_negative(cache_key, True)
+            except Exception as e:
+                _debug_suppressed(e)
             return None
+
+        best_season_match = False
 
         for v in (variants if isinstance(variants, list) and variants else [q0]):
             if not v:
@@ -488,8 +839,15 @@ def buscar_anime_por_titulo_jikan(titulo):
                         try:
                             season_num = int(g)
                             break
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            _debug_suppressed(e)
+            if season_num is None:
+                try:
+                    m_rn = re.search(r"\b(i|ii|iii|iv|v|vi|vii|viii|ix|x)\b\s*(?:season|temporada)?\b", str(v), re.IGNORECASE)
+                    if m_rn:
+                        season_num = roman_map_local.get(m_rn.group(1).upper())
+                except Exception:
+                    season_num = None
 
             mroman = re.search(r"\b(I|II|III|IV|V|VI|VII|VIII|IX|X)\b", v, re.IGNORECASE)
             if not season_num and mroman:
@@ -515,15 +873,16 @@ def buscar_anime_por_titulo_jikan(titulo):
                                 t = str(s)
                             if t:
                                 cand_titles.append(t.strip().lower())
-                    except Exception:
-                        pass
-
+                    except Exception as e:
+                        _debug_suppressed(e)
                     query_norm = v.strip().lower()
                     sim_scores = [SequenceMatcher(None, query_norm, ct).ratio() for ct in cand_titles if ct]
                     base_sim = max(sim_scores) if sim_scores else 0.0
 
                     tokens = re.findall(r"\w+", query_norm)
-                    tokens = [t for t in tokens if t and len(t) > 1]
+                    # Keep numeric tokens too (e.g. "Season 3"), otherwise season queries often
+                    # collapse to the base series and match the first/most popular result.
+                    tokens = [t for t in tokens if t and (len(t) > 1 or t.isdigit())]
                     token_ratio = 0.0
                     if tokens:
                         joined = ' '.join(cand_titles)
@@ -532,6 +891,7 @@ def buscar_anime_por_titulo_jikan(titulo):
 
                     score = 0.6 * token_ratio + 0.35 * base_sim
 
+                    season_found = False
                     if season_num:
                         season_found = False
                         for ct in cand_titles:
@@ -546,10 +906,13 @@ def buscar_anime_por_titulo_jikan(titulo):
                                     if roman_map_local.get(rn) == season_num:
                                         season_found = True
                                         break
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    _debug_suppressed(e)
                         if season_found:
-                            score += 0.28
+                            score += 0.40
+                        else:
+                            # When the query clearly implies a season, penalize results that don't.
+                            score -= 0.22
 
                     try:
                         my = re.search(r"\b(19|20)\d{2}\b", v)
@@ -558,21 +921,20 @@ def buscar_anime_por_titulo_jikan(titulo):
                             aired = cand.get('year') or ''
                             if aired and str(aired).startswith(year_match_val):
                                 score += 0.15
-                    except Exception:
-                        pass
-
+                    except Exception as e:
+                        _debug_suppressed(e)
                     try:
                         te = (cand.get('title_english') or '').strip().lower()
                         if te and te == query_norm:
                             score += 0.25
-                    except Exception:
-                        pass
-
+                    except Exception as e:
+                        _debug_suppressed(e)
                     if score > best_score:
                         best_score = score
                         best_result = cand
+                        best_season_match = bool(season_found) if season_num else False
 
-                if best_score >= 0.78:
+                if best_score >= 0.78 and (not season_num or best_season_match):
                     break
             except Exception as e:
                 # Keep the last provider/network error so callers can distinguish "no match"
@@ -585,6 +947,10 @@ def buscar_anime_por_titulo_jikan(titulo):
             return best_result
         if last_error is not None:
             raise last_error
+        try:
+            cache_set_negative(cache_key, True)
+        except Exception as e:
+            _debug_suppressed(e)
         return None
     except Exception as e:
         logging.warning("provider_jikan.buscar_anime_por_titulo_jikan '%s' (variants=%s): %s", titulo, normalize_folder_name_for_search(titulo), e)

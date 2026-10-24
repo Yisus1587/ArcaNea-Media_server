@@ -102,6 +102,7 @@ export const useMediaLibrary = ({
       const cacheKey = `${profile.isKid ? 'kid' : 'std'}|${currentView}|${(types || []).join(',')}|q:${(searchQuery || '')
         .trim()
         .toLowerCase()}`;
+      const compactHome = currentView === 'home' && !(searchQuery || '').trim();
 
       if (reset) {
         if (!silent) setLoading(true);
@@ -131,7 +132,7 @@ export const useMediaLibrary = ({
           return;
         }
 
-        const data = await MediaService.getAll(targetPage, pageSize, (searchQuery || '').trim() || undefined, types);
+        const data = await MediaService.getAll(targetPage, pageSize, (searchQuery || '').trim() || undefined, types, !!profile.isKid);
         const baseIncoming = Array.isArray(data.items) ? data.items : [];
         const incoming = profile.isKid ? baseIncoming.filter(_isKidSafeItem) : baseIncoming;
         const existing = reset ? [] : mediaItemsRef.current || [];
@@ -211,13 +212,13 @@ export const useMediaLibrary = ({
 
         if (reset) {
           const total = typeof data.total === 'number' ? data.total : 0;
-          const shouldPrefetch = total > pageSize && !prefetchingRef.current;
+          const shouldPrefetch = total > pageSize && !prefetchingRef.current && !compactHome;
           if (shouldPrefetch) {
             prefetchingRef.current = true;
             void (async () => {
               try {
                 const nextPage = targetPage + 1;
-                const res = await MediaService.getAll(nextPage, pageSize, (searchQuery || '').trim() || undefined, types);
+                const res = await MediaService.getAll(nextPage, pageSize, (searchQuery || '').trim() || undefined, types, !!profile.isKid);
                 const list = Array.isArray(res.items) ? res.items : [];
                 const prev = mediaCacheRef.current.get(cacheKey);
                 if (prev && list.length) {
@@ -340,6 +341,7 @@ export const useMediaLibrary = ({
     if (appStage !== 'app') return;
     if (!currentUser) return;
     if (currentView === 'settings' || currentView === 'list') return;
+    if (currentView === 'home' && !(searchQuery || '').trim()) return;
     if (!hasMoreMedia) return;
     if (loading || loadingMoreMedia) return;
     const root = scrollContainerRef.current;
@@ -358,6 +360,35 @@ export const useMediaLibrary = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [appStage, currentUser?.id, currentView, searchQuery, hasMoreMedia, loadingMoreMedia, loading]);
 
+  // Scroll fallback: ensure we keep paging even if the sentinel stays intersecting.
+  useEffect(() => {
+    if (appStage !== 'app') return;
+    if (!currentUser) return;
+    if (currentView === 'settings' || currentView === 'list') return;
+    if (currentView === 'home' && !(searchQuery || '').trim()) return;
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    let ticking = false;
+    const check = () => {
+      if (!hasMoreMedia || loading || loadingMoreMedia) return;
+      const nearBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 800;
+      if (nearBottom) {
+        void fetchMedia({ reset: false, userProfile: currentUser });
+      }
+    };
+    const onScroll = () => {
+      if (ticking) return;
+      ticking = true;
+      requestAnimationFrame(() => {
+        ticking = false;
+        check();
+      });
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    check();
+    return () => el.removeEventListener('scroll', onScroll);
+  }, [appStage, currentUser?.id, currentView, searchQuery, hasMoreMedia, loadingMoreMedia, loading, fetchMedia]);
+
   // Debounced search logic - GLOBAL SEARCH
   useEffect(() => {
     if (appStage !== 'app') return;
@@ -374,38 +405,47 @@ export const useMediaLibrary = ({
     if (!q) {
       setLocalSearchActive(false);
       setLocalSearchResults([]);
-    } else if (q.length >= 2) {
-      (async () => {
-        try {
-          const profile = currentUser;
-          if (profile) {
-            const types = _computeMediaTypes(profile, currentView, '');
-            const res = await MediaService.searchSuggest(q, 20, types);
-            if (cancelled) return;
-            const list = Array.isArray(res?.items) ? res.items : [];
-            if (list.length) {
-              setLocalSearchActive(true);
-              setLocalSearchResults(list);
-            } else {
-              setLocalSearchActive(false);
-              setLocalSearchResults([]);
-            }
-          }
-        } catch {
-          if (cancelled) return;
-          setLocalSearchActive(false);
-          setLocalSearchResults([]);
-        }
-      })();
     }
 
-    const timeoutId = setTimeout(() => {
+    // Single debounce for both: (1) remote search results, (2) quick suggestions.
+    // This prevents 2x request bursts on every keystroke and keeps the UI responsive.
+    const timeoutId = window.setTimeout(() => {
+      if (cancelled) return;
+
+      if (q.length >= 2) {
+        (async () => {
+          try {
+            const profile = currentUser;
+            if (profile) {
+              const types = _computeMediaTypes(profile, currentView, '');
+              const res = await MediaService.searchSuggest(q, 20, types);
+              if (cancelled) return;
+              const list = Array.isArray(res?.items) ? res.items : [];
+              if (list.length) {
+                setLocalSearchActive(true);
+                setLocalSearchResults(list);
+              } else {
+                setLocalSearchActive(false);
+                setLocalSearchResults([]);
+              }
+            }
+          } catch {
+            if (cancelled) return;
+            setLocalSearchActive(false);
+            setLocalSearchResults([]);
+          }
+        })();
+      } else if (!q) {
+        setLocalSearchActive(false);
+        setLocalSearchResults([]);
+      }
+
       fetchMedia({ reset: true });
-    }, 200);
+    }, q ? 320 : 0);
 
     return () => {
       cancelled = true;
-      clearTimeout(timeoutId);
+      window.clearTimeout(timeoutId);
     };
   }, [searchQuery, appStage, currentView, currentUser?.id]);
 

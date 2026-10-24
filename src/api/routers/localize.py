@@ -1,48 +1,61 @@
 from __future__ import annotations
 
-import logging
+from fastapi import APIRouter, Depends, HTTPException
 
-from fastapi import APIRouter, HTTPException, Depends
-
-from ...tools.apply_db_migrations import main as apply_db_migrations_main
-from ...services.localize_runner import start_localization_job, request_stop, is_running
-from ...services.localize_state import get_state
 from ..deps import admin_required
 
 
 router = APIRouter()
 
 
+def _disabled_response() -> dict:
+    return {
+        "running": False,
+        "disabled": True,
+        "detail": "language tooling was moved to devtools/lenguaje and is not part of the production backend flow",
+    }
+
+
 @router.get("/api/localize/status")
 def localize_status():
-    try:
-        st = get_state()
-        st["running"] = bool(is_running() or st.get("running"))
-        return st
-    except Exception:
-        logging.getLogger(__name__).exception("Failed computing localize status")
-        return {"running": False}
+    return _disabled_response()
 
 
 @router.post("/api/localize/start")
-def localize_start(limit_series: int | None = None, limit_seasons: int | None = None, _: bool = Depends(admin_required)):
-    """Start the TMDB localization job (non-blocking)."""
-    try:
-        try:
-            apply_db_migrations_main()
-        except Exception:
-            logging.getLogger(__name__).exception("DB migration failed before localization")
-        started = start_localization_job(limit_series=limit_series, limit_seasons=limit_seasons)
-        return {"started": bool(started)}
-    except Exception:
-        logging.getLogger(__name__).exception("Unexpected error starting localization")
-        raise HTTPException(status_code=500, detail="Unexpected error")
+def localize_start(_: bool = Depends(admin_required)):
+    raise HTTPException(status_code=410, detail=_disabled_response()["detail"])
 
 
 @router.post("/api/localize/stop")
 def localize_stop(_: bool = Depends(admin_required)):
-    try:
-        request_stop()
-        return {"stop_requested": True}
-    except Exception as e:
-        return {"stop_requested": False, "error": str(e)}
+    return {"stop_requested": False, **_disabled_response()}
+
+
+@router.post("/api/localize/translations-only")
+def localize_translations_only(_: bool = Depends(admin_required)):
+    raise HTTPException(status_code=410, detail=_disabled_response()["detail"])
+
+
+@router.post("/api/localize/series/{tmdb_id}/reconcile")
+def localize_reconcile_series(tmdb_id: str, _: bool = Depends(admin_required)):
+    raise HTTPException(status_code=410, detail=_disabled_response()["detail"])
+
+
+@router.post("/api/localize/translations-finalize")
+def localize_translations_finalize(_: bool = Depends(admin_required)):
+    raise HTTPException(status_code=410, detail=_disabled_response()["detail"])
+
+
+@router.post("/api/localize/normalize-language")
+def localize_normalize_language(_: bool = Depends(admin_required)):
+    raise HTTPException(status_code=410, detail=_disabled_response()["detail"])
+
+
+@router.post("/api/localize/anime-translations")
+def localize_anime_translations(_: bool = Depends(admin_required)):
+    raise HTTPException(status_code=410, detail=_disabled_response()["detail"])
+
+
+@router.get("/api/localize/tmdb-anchor-probe")
+def localize_tmdb_anchor_probe(_: bool = Depends(admin_required)):
+    raise HTTPException(status_code=410, detail=_disabled_response()["detail"])

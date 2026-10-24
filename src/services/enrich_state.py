@@ -8,6 +8,7 @@ _state: Dict[str, Any] = {
     'current_id': None,
     'current_title': None,
     'current_step': None,
+    'task_id': None,
     'last_updated': None,
 }
 
@@ -26,4 +27,4 @@ def get_state() -> Dict[str, Any]:
 
 def clear_state():
     with _lock:
-        _state.update({'running': False, 'current_id': None, 'current_title': None, 'current_step': None})
+        _state.update({'running': False, 'current_id': None, 'current_title': None, 'current_step': None, 'task_id': None})

@@ -120,7 +120,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             {scanRunning ? (
               <div className="hidden sm:flex items-center gap-2 text-[11px] text-slate-300 bg-white/5 border border-white/10 rounded-full px-2 py-1 mr-2">
                 <span className="inline-block h-1.5 w-1.5 rounded-full bg-indigo-500 animate-pulse" />
-                {typeof scanProgress === 'number' ? `${scanProgress}%` : '...'}
+                {t('scanning')}
               </div>
             ) : null}
             {isOpen && (
@@ -328,15 +328,19 @@ export const Sidebar: React.FC<SidebarProps> = ({
     {/* Mobile header + bottom navigation */}
     {isMobile ? (
       <>
-        <div className="fixed top-0 left-0 right-0 z-50 backdrop-blur-md bg-black/10 border-b border-white/5">
-          <div className="h-12 flex items-center justify-between px-4">
-            <div className="flex items-center gap-2">
-              <div className="text-lg font-bold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-indigo-500 to-purple-600">
+        <div className="fixed top-0 left-0 right-0 z-50 bg-[#0b1220]/80 backdrop-blur-xl border-b border-white/5">
+          <div className="h-14 flex items-center justify-between px-4">
+            <div className="flex items-center gap-3">
+              <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center shadow-lg shadow-indigo-500/20">
+                <img src="/icons/arcanea-icon.svg" alt="ArcaNea" className="w-5 h-5" />
+              </div>
+              <div className="text-xl font-bold tracking-tight text-white">
                 ArcaNea
               </div>
               {scanRunning ? (
-                <div className="text-[11px] text-slate-300 bg-white/5 border border-white/10 rounded-full px-2 py-0.5">
-                  {typeof scanProgress === 'number' ? `${scanProgress}%` : '...'}
+                <div className="flex items-center gap-1.5 text-[10px] font-bold text-indigo-400 bg-indigo-500/10 border border-indigo-500/20 rounded-full px-2 py-0.5 animate-pulse">
+                  <span className="w-1 h-1 rounded-full bg-indigo-400" />
+                  {t('scanning')}
                 </div>
               ) : null}
             </div>
@@ -346,38 +350,27 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 requestFocusSearchRef.current = true;
                 onRequestOpen?.();
               }}
-              className="p-2 rounded-lg text-slate-300 hover:text-white hover:bg-white/10 transition-colors"
+              className={`p-2.5 rounded-xl transition-all ${isOpen ? 'bg-indigo-500 text-white' : 'text-slate-300 bg-white/5 border border-white/5'}`}
               aria-label={t('search')}
             >
-              <Search size={18} />
+              <Search size={20} />
             </button>
           </div>
         </div>
 
         {isOpen ? (
           <>
-            <div className="fixed inset-0 z-40" onClick={() => onRequestClose?.()} aria-hidden="true" />
-            <div className="fixed top-12 left-0 right-0 z-50 px-4 pt-3 pb-4 bg-[#0b1220]/95 backdrop-blur-xl border-b border-white/5">
-              <div className="relative">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" size={16} />
+            <div className="fixed inset-0 z-40 bg-black/60 backdrop-blur-sm" onClick={() => onRequestClose?.()} aria-hidden="true" />
+            <div className="fixed top-14 left-0 right-0 z-50 p-4 bg-[#0b1220]/95 backdrop-blur-2xl border-b border-white/5 animate-in slide-in-from-top duration-300">
+              <div className="relative group">
+                <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-indigo-400 transition-colors" size={18} />
                 <input 
                   ref={searchInputRef}
                   type="text" 
                   placeholder={t('search_placeholder')} 
                   value={searchQuery}
                   onChange={(e) => onSearch(e.target.value)}
-                  onBlur={() => {
-                    if (!pinned && onRequestClose) {
-                      onRequestClose();
-                    }
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Escape') {
-                      e.preventDefault();
-                      onRequestClose?.();
-                    }
-                  }}
-                  className="w-full bg-slate-800/50 border border-white/5 rounded-lg py-2 pl-10 pr-8 text-sm text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500/50 transition-all"
+                  className="w-full bg-white/5 border border-white/10 rounded-2xl py-3.5 pl-12 pr-12 text-base text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 transition-all shadow-inner"
                 />
                 {searchQuery && (
                   <button 
@@ -385,9 +378,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
                       onSearch('');
                       searchInputRef.current?.focus();
                     }}
-                    className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-500 hover:text-white p-1 rounded-full hover:bg-white/10 transition-colors"
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white p-1.5 rounded-full bg-white/5 transition-colors"
                   >
-                    <X size={14} />
+                    <X size={16} />
                   </button>
                 )}
               </div>
@@ -399,53 +392,67 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <div className="fixed inset-0 z-40" onClick={() => setIsProfileMenuOpen(false)} aria-hidden="true" />
         )}
         {isProfileMenuOpen && (
-          <div ref={profileMenuRef} className="fixed bottom-20 left-4 right-4 z-50 bg-[#1e293b] border border-white/10 rounded-xl shadow-2xl overflow-hidden animate-slide-up">
-            <div className="p-2 space-y-1">
-              <div className="px-2 py-1.5 text-xs font-semibold text-slate-500 uppercase tracking-wider">{t('switch_profile')}</div>
-              <div className="h-px bg-white/5 my-1" />
-              {profiles.map(profile => (
-                <button
-                  key={profile.id}
+          <div ref={profileMenuRef} className="fixed bottom-20 left-4 right-4 z-50 bg-slate-900/95 backdrop-blur-2xl border border-white/10 rounded-3xl shadow-[0_20px_50px_rgba(0,0,0,0.5)] overflow-hidden animate-slide-up">
+            <div className="p-4 space-y-4">
+              <div className="flex items-center gap-4 px-2 pb-2 border-b border-white/5">
+                <div className={`w-12 h-12 rounded-2xl flex items-center justify-center shrink-0 shadow-lg overflow-hidden ${currentUser?.avatarColor || 'bg-slate-700'}`}>
+                  {currentUser?.avatarImage ? (
+                    <img src={currentUser.avatarImage} alt={currentUser.name} className="w-full h-full object-cover" />
+                  ) : (
+                    <span className="font-bold text-white text-lg">{currentUser?.name?.[0] || 'U'}</span>
+                  )}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-base font-bold text-white truncate">{currentUser?.name || t('user')}</p>
+                  <p className="text-xs text-slate-400 truncate">{currentUser?.isKid ? t('kid_profile') : t('standard_profile')}</p>
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <div className="px-2 py-1 text-[10px] font-bold text-slate-500 uppercase tracking-widest">{t('switch_profile')}</div>
+                <div className="grid grid-cols-2 gap-2">
+                  {profiles.map(profile => (
+                    <button
+                      key={profile.id}
+                      onClick={() => {
+                        if (profile.id !== currentUser?.id) {
+                          onSwitchProfile(profile);
+                        }
+                        setIsProfileMenuOpen(false);
+                      }}
+                      className={`flex flex-col items-center gap-2 p-3 rounded-2xl transition-all ${profile.id === currentUser?.id ? 'bg-indigo-600/20 ring-1 ring-indigo-500/30' : 'bg-white/5 hover:bg-white/10'}`}
+                    >
+                      <div className={`w-10 h-10 rounded-xl flex items-center justify-center overflow-hidden ${profile.avatarColor}`}>
+                        {profile.avatarImage ? (
+                          <img src={profile.avatarImage} alt={profile.name} className="w-full h-full object-cover" />
+                        ) : (
+                          <span className="text-sm font-bold text-white">{profile.name[0]}</span>
+                        )}
+                      </div>
+                      <span className={`text-xs font-semibold truncate w-full text-center ${profile.id === currentUser?.id ? 'text-indigo-300' : 'text-slate-300'}`}>{profile.name}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="pt-2 border-t border-white/5">
+                <button 
                   onClick={() => {
-                    if (profile.id !== currentUser?.id) {
-                      onSwitchProfile(profile);
-                    }
+                    onLogout();
                     setIsProfileMenuOpen(false);
                   }}
-                  className={`w-full flex items-center px-2 py-2 rounded-lg transition-colors ${profile.id === currentUser?.id ? 'bg-indigo-600/20 text-indigo-300' : 'hover:bg-white/5 text-slate-300 hover:text-white'}`}
+                  className="w-full flex items-center justify-center gap-3 py-3 rounded-2xl bg-red-500/10 text-red-400 active:scale-95 transition-all font-bold text-sm"
                 >
-                  <div className={`w-6 h-6 rounded-md flex items-center justify-center mr-3 overflow-hidden ${profile.avatarColor}`}>
-                    {profile.avatarImage ? (
-                      <img src={profile.avatarImage} alt={profile.name} className="w-full h-full object-cover" loading="lazy" />
-                    ) : (
-                      <span className="text-xs font-bold text-white">{profile.name[0]}</span>
-                    )}
-                  </div>
-                  <span className="text-sm font-medium flex-1 text-left">{profile.name}</span>
-                  {profile.id === currentUser?.id && <Check size={14} />}
+                   <LogOut size={18} />
+                   {t('logout')}
                 </button>
-              ))}
-              <div className="h-px bg-white/5 my-1" />
-              <button 
-                onClick={() => {
-                  onLogout();
-                  setIsProfileMenuOpen(false);
-                }}
-                className="w-full flex items-center px-2 py-2 rounded-lg text-red-400 hover:bg-red-500/10 transition-colors text-sm"
-              >
-                 <LogOut size={16} className="mr-3" />
-                 {t('logout')}
-              </button>
+              </div>
             </div>
           </div>
         )}
         <nav className="fixed bottom-0 left-0 right-0 z-50 bg-[#0b1220]/95 backdrop-blur-xl border-t border-white/5 pb-[env(safe-area-inset-bottom)]">
-          <div className="h-14 flex items-center justify-around px-2">
-            {[
-              { id: 'home', label: t('nav_home'), icon: Home },
-              { id: 'movies', label: t('nav_movies'), icon: Film },
-              { id: 'tv', label: t('nav_series'), icon: Tv },
-            ].map((item) => {
+          <div className="h-16 flex items-center justify-around px-2">
+            {navItems.map((item) => {
               const Icon = item.icon;
               const active = currentView === item.id;
               return (
@@ -455,21 +462,27 @@ export const Sidebar: React.FC<SidebarProps> = ({
                     onChangeView(item.id as ViewState);
                     setIsProfileMenuOpen(false);
                   }}
-                  className={`flex flex-col items-center justify-center text-xs transition-transform active:scale-110 ${active ? 'text-indigo-500' : 'text-slate-400 hover:text-white'}`}
+                  className={`flex flex-col items-center justify-center min-w-[60px] h-full transition-all active:scale-90 ${active ? 'text-indigo-400' : 'text-slate-400'}`}
                 >
-                  <Icon size={20} className={active ? 'text-indigo-500' : 'text-slate-400'} />
-                  <div className={`mt-1 h-1 w-1 rounded-full ${active ? 'bg-indigo-500 shadow-[0_0_8px_rgba(99,102,241,0.8)]' : 'bg-transparent'}`} />
-                  <span className="mt-1">{item.label}</span>
+                  <div className={`p-1.5 rounded-xl transition-colors ${active ? 'bg-indigo-500/10' : ''}`}>
+                    <Icon size={22} className={active ? 'text-indigo-400' : 'text-slate-400'} />
+                  </div>
+                  <span className={`text-[10px] mt-0.5 font-medium transition-colors ${active ? 'text-indigo-400' : 'text-slate-500'}`}>
+                    {item.label}
+                  </span>
                 </button>
               );
             })}
             <button
               onClick={() => setIsProfileMenuOpen(!isProfileMenuOpen)}
-              className="flex flex-col items-center justify-center text-xs text-slate-400 hover:text-white transition-transform active:scale-110"
+              className={`flex flex-col items-center justify-center min-w-[60px] h-full transition-all active:scale-90 ${isProfileMenuOpen ? 'text-indigo-400' : 'text-slate-400'}`}
             >
-              <User size={20} />
-              <div className="mt-1 h-1 w-1 rounded-full bg-transparent" />
-              <span className="mt-1">{t('profile')}</span>
+              <div className={`p-1.5 rounded-xl transition-colors ${isProfileMenuOpen ? 'bg-indigo-500/10' : ''}`}>
+                <User size={22} />
+              </div>
+              <span className={`text-[10px] mt-0.5 font-medium ${isProfileMenuOpen ? 'text-indigo-400' : 'text-slate-500'}`}>
+                {t('profile')}
+              </span>
             </button>
           </div>
         </nav>

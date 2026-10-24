@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { MediaItem, UserProfile } from '../types';
 import { MediaService } from '../services/api';
 
@@ -17,9 +17,11 @@ export const usePlayerState = ({
 }: UsePlayerStateParams) => {
   const [playingMedia, setPlayingMedia] = useState<MediaItem | null>(null);
   const [playingSrc, setPlayingSrc] = useState<string | null>(null);
+  const [playingStartTime, setPlayingStartTime] = useState<number>(0);
   const [playerSeasons, setPlayerSeasons] = useState<
     Array<{ key: string; label: string; episodes: any[]; baseItem: any }>
   >([]);
+  const lastProgressSentRef = useRef<number>(0);
 
   const extractNextSeries = (srcItem: any): any | null => {
     try {
@@ -74,6 +76,41 @@ export const usePlayerState = ({
 
   const buildPlayerSeasons = async (base: any) => {
     if (!base) return [];
+    const playlistSections = (() => {
+      const raw = base?.seasonPlaylists;
+      if (!raw || typeof raw !== 'object') return null;
+      const parsed = Object.entries(raw)
+        .map(([k, v]) => ({
+          season: Number(k),
+          episodes: Array.isArray(v) ? v : [],
+        }))
+        .filter((entry) => entry.episodes.length > 0);
+      if (!parsed.length) return null;
+      parsed.sort((a, b) => {
+        if (Number.isFinite(a.season) && Number.isFinite(b.season)) return a.season - b.season;
+        if (Number.isFinite(a.season)) return -1;
+        if (Number.isFinite(b.season)) return 1;
+        return 0;
+      });
+      return parsed.map((entry, idx) => {
+        const seasonNumber = Number.isFinite(entry.season) ? entry.season : undefined;
+        const normalizedEpisodes = entry.episodes.map((f: any, i: number) => {
+          const epNo = guessEpisodeNumber(f?.path || '') ?? f?.index ?? f?.file_index ?? i + 1;
+          return {
+            ...f,
+            index: epNo,
+            file_index: epNo,
+            episodeTitle: f?.episodeTitle || f?.title || undefined,
+            seasonNumber: seasonNumber ?? f?.seasonNumber,
+          };
+        });
+        const key = Number.isFinite(entry.season) ? `s${entry.season}` : `s-${idx + 1}`;
+        const label = seasonNumber ? `Temporada ${seasonNumber}` : (base?.title || 'Temporada');
+        return { key, label, episodes: normalizedEpisodes, baseItem: { ...(base as any), selectedSeason: seasonNumber ?? base?.selectedSeason } };
+      });
+    })();
+    if (playlistSections && playlistSections.length) return playlistSections;
+
     const rel = Array.isArray(base.related) ? base.related : [];
     const prequels = rel.filter((r: any) => String(r?.relation || '').toLowerCase() === 'prequel');
     const sequels = rel.filter((r: any) => String(r?.relation || '').toLowerCase() === 'sequel');
@@ -86,8 +123,24 @@ export const usePlayerState = ({
         if (!Number.isFinite(id)) return buildEpisodesFromMedia(media);
         const res = await MediaService.getEpisodeSeasons(id, { includeRelated: false });
         const seasons = Array.isArray(res?.seasons) ? res.seasons : [];
-        const self = seasons.find((s: any) => Number(s?.media_item_id) === id) || seasons[0] || null;
+        const targetSeason = Number(media?.selectedSeason ?? media?.seasonNumber ?? media?.season_number ?? NaN);
+        const mediaPath = media?.path ? String(media.path) : '';
+        const self =
+          seasons.find((s: any) => Number(s?.media_item_id ?? s?.mediaItemId) === id) ||
+          (Number.isFinite(targetSeason)
+            ? seasons.find((s: any) => Number(s?.season_number ?? s?.seasonNumber ?? NaN) === targetSeason)
+            : null) ||
+          (mediaPath
+            ? seasons.find(
+              (s: any) =>
+                Array.isArray(s?.episodes) &&
+                s.episodes.some((e: any) => String(e?.file?.path || '') === mediaPath),
+            )
+            : null) ||
+          seasons[0] ||
+          null;
         const eps = self && Array.isArray(self.episodes) ? self.episodes : [];
+        if (!eps.length) return buildEpisodesFromMedia(media);
         return eps.map((e: any) => {
           const epNo = Number(e?.episode_number ?? e?.episodeNumber ?? 0);
           const file = e?.file || {};
@@ -110,7 +163,10 @@ export const usePlayerState = ({
 
     const addSection = async (media: any, label: string) => {
       const episodes = await episodesFromDb(media);
-      sections.push({ key: `m${media?.id}`, label, episodes, baseItem: media });
+      const rawId = Number(media?.id);
+      const baseKey = Number.isFinite(rawId) ? `m${rawId}` : `m-${sections.length + 1}`;
+      const key = sections.some((s) => s.key === baseKey) ? `${baseKey}-${sections.length + 1}` : baseKey;
+      sections.push({ key, label, episodes, baseItem: media });
     };
 
     for (const r of prequels) {
@@ -133,6 +189,33 @@ export const usePlayerState = ({
     return sections;
   };
 
+  const resolveResume = useCallback(
+    async (itemId: number, files: any[], fallbackPath: string | null | undefined) => {
+      try {
+        const res = await MediaService.getPlaybackProgress(itemId, currentUser?.id);
+        const pos = Number(res?.position ?? 0);
+        const dur = Number(res?.duration ?? 0);
+        const ratio = dur > 0 ? pos / dur : 0;
+        if (!Number.isFinite(pos) || !Number.isFinite(dur) || dur <= 0) {
+          return { startTime: 0, path: fallbackPath || null };
+        }
+        if (ratio >= 0.95 || pos < 5) {
+          return { startTime: 0, path: fallbackPath || null };
+        }
+        const savedPath = res?.path ? String(res.path) : null;
+        let nextPath = fallbackPath || null;
+        if (savedPath && files && files.length) {
+          const hit = files.find((f) => String(f?.path || '') === savedPath);
+          if (hit) nextPath = savedPath;
+        }
+        return { startTime: pos, path: nextPath };
+      } catch {
+        return { startTime: 0, path: fallbackPath || null };
+      }
+    },
+    [currentUser?.id],
+  );
+
   useEffect(() => {
     let cancelled = false;
     const run = async () => {
@@ -149,6 +232,10 @@ export const usePlayerState = ({
     };
   }, [playingMedia?.id, playingMedia?.path, lang]);
 
+  useEffect(() => {
+    lastProgressSentRef.current = 0;
+  }, [playingMedia?.id, playingMedia?.path]);
+
   const handlePlayById = useCallback(
     async (id: number) => {
       try {
@@ -156,9 +243,12 @@ export const usePlayerState = ({
         const files = Array.isArray((d as any).files) ? (d as any).files : [];
         let path = (d as any).path;
         if (!path && files.length) path = files[0]?.path;
+        const resume = await resolveResume(id, files, path);
+        if (resume.path) path = resume.path;
         const nextSeries = extractNextSeries(d);
         const playItem: any = { ...(d as any), path, files, nextSeries };
         onCloseDetail?.();
+        setPlayingStartTime(resume.startTime || 0);
         setPlayingMedia(playItem);
         recordPlay(id);
         try {
@@ -192,7 +282,17 @@ export const usePlayerState = ({
             anyItem.path = anyItem.path || list[0]?.path;
           }
         }
+        let resumeStart = 0;
+        if (anyItem?.id) {
+          try {
+            const files = Array.isArray(anyItem?.files) ? anyItem.files : [];
+            const resume = await resolveResume(Number(anyItem.id), files, anyItem.path);
+            resumeStart = resume.startTime || 0;
+            if (resume.path) anyItem.path = resume.path;
+          } catch {}
+        }
         const nextSeries = extractNextSeries(anyItem);
+        setPlayingStartTime(resumeStart || 0);
         setPlayingMedia({ ...(anyItem as any), nextSeries });
         recordPlay(anyItem?.id ?? null);
         try {
@@ -254,6 +354,7 @@ export const usePlayerState = ({
       } catch (e) {
         console.error('Failed to build stream url', e);
       }
+      setPlayingStartTime(0);
       setPlayingMedia({ ...playingMedia, path: nextPath });
     },
     [playingFiles, playingMedia],
@@ -290,6 +391,7 @@ export const usePlayerState = ({
       const nextPath = String(ep.path);
       const nextFiles = section.episodes || [];
       const baseItem = section.baseItem || playingMedia;
+      setPlayingStartTime(0);
       setPlayingMedia({ ...(baseItem as any), path: nextPath, files: nextFiles });
       try {
         const src = MediaService.getStreamUrlFromPath(nextPath);
@@ -302,22 +404,40 @@ export const usePlayerState = ({
   const closePlayer = useCallback(() => {
     setPlayingMedia(null);
     setPlayingSrc(null);
+    setPlayingStartTime(0);
   }, []);
 
   const hasPrevItem = playingFiles.length > 1 && playingFileIndex > 0;
   const hasNextItem = playingFiles.length > 1 && playingFileIndex >= 0 && playingFileIndex < playingFiles.length - 1;
+
+  const handleProgressUpdate = useCallback(
+    (payload: { current: number; duration: number; progress?: number; force?: boolean; ended?: boolean }) => {
+      if (!playingMedia?.id) return;
+      const now = Date.now();
+      const force = !!payload.force || !!payload.ended;
+      if (!force && now - lastProgressSentRef.current < 5000) return;
+      lastProgressSentRef.current = now;
+      const position = Math.max(0, Number(payload.current || 0));
+      const duration = Math.max(0, Number(payload.duration || 0));
+      const path = (playingMedia as any)?.path ? String((playingMedia as any).path) : null;
+      MediaService.savePlaybackProgress(Number(playingMedia.id), { position, duration, path }, currentUser?.id).catch(() => {});
+    },
+    [currentUser?.id, playingMedia],
+  );
 
   return {
     playingMedia,
     playingSrc,
     playerSeasons,
     nowPlayingLabel,
+    playingStartTime,
     handlePlay,
     handlePlayById,
     handleNextPlayingItem,
     handlePrevPlayingItem,
     handleContinueNextSeries,
     handleSelectEpisode,
+    handleProgressUpdate,
     closePlayer,
     hasPrevItem,
     hasNextItem,

@@ -1,24 +1,34 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import {
   HardDrive, FolderPlus, Trash2, Database, ScanLine, Loader2,
-  RefreshCw, CheckCircle, AlertCircle, Plus, Save, User, Users, Pencil, X
+  RefreshCw, CheckCircle, AlertCircle, Plus, Save, Users, Pencil, X, FolderPlus as FolderPlusIcon,
+  Languages,
 } from 'lucide-react';
 import { Button } from '../ui/Button';
-import { Drive, ScanStatus, MetadataConfig, UserProfile } from '../../types';
+import { Drive, ScanStatus, MetadataConfig, UserProfile, TelemetryEvent, TelemetryTask, ConflictGroup, AdminEntityRow } from '../../types';
 import { useI18n } from '../../i18n/i18n';
+import { MediaService } from '../../services/api';
 import { FolderPickerModal } from './FolderPickerModal';
 import { HelpModal } from './HelpModal';
 import { NoMatchModal } from './NoMatchModal';
+import { SystemStatusDashboard } from './sections/SystemStatusDashboard';
+import { MetadataProviderConfig } from './sections/MetadataProviderConfig';
+import { ActivityFeed } from './sections/ActivityFeed';
+import { EnrichmentTuning } from './sections/EnrichmentTuning';
 
 interface SettingsViewProps {
   drives: Drive[];
   libraryPaths: string[];
+  looseMovieRoots: string[];
+  rootTypes: Record<string, string>;
   scanStatus: ScanStatus;
   metadataConfig: MetadataConfig;
   profiles: UserProfile[];
-  onAddPath: (path: string) => void;
+  onAddPath: (path: string, type?: string) => void;
   onRemovePath: (path: string) => void;
   onUpdateConfig: (config: MetadataConfig) => void;
+  onToggleLooseMovieRoot: (path: string) => void;
+  onSetRootType: (path: string, type: string) => void;
   onStartScan: () => void;
   onRefresh?: () => void;
   onAddProfile: (profile: Omit<UserProfile, 'id'>) => void;
@@ -38,12 +48,14 @@ const AVATAR_COLORS = [
 export const SettingsView: React.FC<SettingsViewProps> = ({
   drives,
   libraryPaths,
+  rootTypes,
   scanStatus,
   metadataConfig,
   profiles,
   onAddPath,
   onRemovePath,
   onUpdateConfig,
+  onSetRootType,
   onStartScan,
   onRefresh,
   onAddProfile,
@@ -52,10 +64,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   enrichment,
   migrationRunning,
   migrationError,
-  onStartEnrich
+  onStartEnrich,
 }) => {
   const { lang, setLang, t } = useI18n();
   const [newPathInput, setNewPathInput] = useState('');
+  const [newPathType, setNewPathType] = useState('auto');
   const [tmdbConfigured, setTmdbConfigured] = useState<boolean | null>(null);
   const [tmdbTestResult, setTmdbTestResult] = useState<string | null>(null);
   const [showTmdbCredentials, setShowTmdbCredentials] = useState(false);
@@ -65,112 +78,182 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [tmdbCredMsg, setTmdbCredMsg] = useState<string | null>(null);
   const [tmdbBusy, setTmdbBusy] = useState<'idle' | 'validating' | 'saving'>('idle');
   const [showTmdbSecrets, setShowTmdbSecrets] = useState(false);
+  const [activeTab, setActiveTab] = useState<'general' | 'control'>('general');
 
   // Profile Management State
   const [editingProfile, setEditingProfile] = useState<Partial<UserProfile> | null>(null);
   const [isCreatingProfile, setIsCreatingProfile] = useState(false);
+  const [avatarBusy, setAvatarBusy] = useState(false);
   const [livePaused, setLivePaused] = useState(false);
   const [showFolderPicker, setShowFolderPicker] = useState(false);
   const [showHelpModal, setShowHelpModal] = useState(false);
   const [showNoMatchModal, setShowNoMatchModal] = useState(false);
+  const [retryProviderMode, setRetryProviderMode] = useState<'auto' | 'jikan' | 'kitsu' | 'tmdb'>('auto');
   const [showSystemLogs, setShowSystemLogs] = useState(false);
   const [logsTail, setLogsTail] = useState<{ path: string; lines: string[]; error?: string } | null>(null);
   const [health, setHealth] = useState<any | null>(null);
   const [enrichHistory, setEnrichHistory] = useState<any[]>([]);
-  const [finalizeBusy, setFinalizeBusy] = useState(false);
-  const [finalizeMsg, setFinalizeMsg] = useState<string | null>(null);
-  const [localize, setLocalize] = useState<any | null>(null);
+  const [jikanFetchEpisodes, setJikanFetchEpisodes] = useState(false);
+  const [enrichRatePerMin, setEnrichRatePerMin] = useState('60');
+  const [enrichBatchSize, setEnrichBatchSize] = useState('20');
+  const [enrichTuningBusy, setEnrichTuningBusy] = useState(false);
+  const [enrichTuningMsg, setEnrichTuningMsg] = useState<string | null>(null);
+  const [enrichPreset, setEnrichPreset] = useState<'safe' | 'balanced' | 'fast'>('balanced');
+  const [showEnrichAdvanced, setShowEnrichAdvanced] = useState(false);
+  const [scanItems, setScanItems] = useState<Array<{ id: number | string; title?: string | null; path?: string | null; media_root?: string | null; media_type?: string | null }>>([]);
+  const [scanItemsTotal, setScanItemsTotal] = useState(0);
+  const [scanItemsBusy, setScanItemsBusy] = useState(false);
+  const [scanItemsError, setScanItemsError] = useState<string | null>(null);
+  const [controlQuery, setControlQuery] = useState('');
+  const [controlResults, setControlResults] = useState<AdminEntityRow[]>([]);
+  const [controlTotal, setControlTotal] = useState(0);
+  const [controlLoading, setControlLoading] = useState(false);
+  const [controlError, setControlError] = useState<string | null>(null);
+  const [conflicts, setConflicts] = useState<{ path_hash: ConflictGroup[]; tmdb_id: ConflictGroup[] } | null>(null);
+  const [conflictsLoading, setConflictsLoading] = useState(false);
+  const [mergeDrafts, setMergeDrafts] = useState<Record<string, { keepId?: number; dropId?: number }>>({});
+  const [resetConfirm, setResetConfirm] = useState('');
+  const [resetBusy, setResetBusy] = useState(false);
+  const [queueBusy, setQueueBusy] = useState(false);
+  const [telemetryConnected, setTelemetryConnected] = useState(false);
+  const [telemetryTasks, setTelemetryTasks] = useState<Record<string, TelemetryTask>>({});
+  const [logEvents, setLogEvents] = useState<TelemetryEvent[]>([]);
+  const [apiEvents, setApiEvents] = useState<TelemetryEvent[]>([]);
+  const [logFilter, setLogFilter] = useState<'all' | 'error'>('all');
+  const [logTaskId, setLogTaskId] = useState<string | null>(null);
   const prevPending = useRef<number | null>(null);
   const prevCurrentId = useRef<number | null>(null);
   const [liveEnrichment, setLiveEnrichment] = useState<any | null>(enrichment || null);
   const pollRef = useRef<number | null>(null);
   const enrich = liveEnrichment || enrichment || null;
-  const activeJob = (localize && localize.running === true)
-    ? { ...(localize || {}), job: 'localize' }
-    : (enrich && enrich.running === true)
-      ? { ...(enrich || {}), job: 'enrich' }
-      : null;
 
-  const formatEnrichStep = (rawStep: any) => {
-    const s = typeof rawStep === 'string' ? rawStep : '';
-    if (!s) return t('starting');
-    const [base, ...rest] = s.split(' ');
-    const progress = rest.join(' ').trim();
-    const label = t('normalizing_user_language');
-    if (base === 'tmdb_sync' || base === 'backfill_episodes' || base === 'series_localize') {
-      return progress ? `${label} (${progress})` : label;
-    }
-    return s;
-  };
+  const TELEMETRY_PHASES = ['Discovery', 'Hashing', 'Jikan_Search', 'TMDB_Enrichment', 'DB_Commit'];
+  const localizeStatus = { disabled: true };
+  const animeNormalizeStatus = { disabled: true };
+  const loc = localizeStatus;
+  const an = animeNormalizeStatus;
+  const locTotal = 0;
+  const locProcessed = 0;
+  const anTotal = 0;
+  const anProcessed = 0;
+  const locPct = 0;
+  const anPct = 0;
+  const locRunning = false;
+  const anRunning = false;
+  const lenguajeBusy: string = 'disabled';
+  const refreshLenguajeStatus = async () => undefined;
+  const handleStartAnimeNormalize = async () => undefined;
+  const handleStopAnimeNormalize = async () => undefined;
+  const handleRunAnimeTranslations = async () => undefined;
 
-  const clampPct = (v: number) => {
-    if (!Number.isFinite(v)) return 0;
-    if (v < 0) return 0;
-    if (v > 100) return 100;
-    return v;
-  };
-
-  const parseStepProgress = (rawStep: any): { done: number; total: number } | null => {
-    const s = String(rawStep || '');
-    const m = s.match(/(\d+)\s*\/\s*(\d+)/);
-    if (!m) return null;
-    const done = Number(m[1]);
-    const total = Number(m[2]);
-    if (!Number.isFinite(done) || !Number.isFinite(total) || total <= 0) return null;
-    return { done, total };
-  };
-
-  const computeScanProgress = () => {
-    try {
-      const processed = (scanStatus as any).processed ?? (scanStatus as any).processedFiles;
-      const total = (scanStatus as any).total ?? (scanStatus as any).totalFiles;
-      if (typeof processed === 'number' && typeof total === 'number' && total > 0) {
-        return clampPct((processed / total) * 100);
+  const applyTelemetryEvent = (raw: TelemetryEvent) => {
+    if (!raw || !raw.task_id) return;
+    const ev = raw as TelemetryEvent;
+    setTelemetryTasks(prev => {
+      const next = { ...(prev || {}) } as Record<string, TelemetryTask>;
+      const existing = next[ev.task_id] || { task_id: ev.task_id };
+      const t: TelemetryTask = { ...existing };
+      if (ev.task_kind) t.task_kind = ev.task_kind;
+      if (ev.title) t.title = ev.title;
+      if (ev.media_item_id != null) t.media_item_id = ev.media_item_id;
+      if (ev.type === 'task.start' || ev.type === 'task.queued') {
+        t.status = ev.status || 'running';
       }
-    } catch {}
-    const p = Number(scanStatus.progress || 0);
-    return clampPct(scanStatus.scanning ? Math.min(p, 99) : p);
-  };
-
-  const computeEnrichProgress = (job: any) => {
-    try {
-      const total = Number(job?.total ?? 0);
-      const pendingTotal = (typeof job?.pending_total === 'number') ? Number(job.pending_total) : undefined;
-      const pending = (typeof job?.pending === 'number') ? Number(job.pending) : undefined;
-      if (total > 0 && (pendingTotal !== undefined || pending !== undefined)) {
-        const left = pendingTotal !== undefined ? pendingTotal : (pending as number);
-        return clampPct(((total - left) / total) * 100);
+      if (ev.type === 'task.end') {
+        t.status = ev.status || 'done';
+        t.current_phase = null;
       }
-    } catch {}
-    const step = parseStepProgress(job?.current_step);
-    if (step) return clampPct((step.done / step.total) * 100);
-    return 0;
+      if (ev.type === 'task.phase' && ev.phase) {
+        const phases = { ...(t.phases || {}) };
+        const ph = { ...(phases[ev.phase] || {}) };
+        if (ev.status) {
+          if (ev.status === 'enter') ph.status = 'running';
+          else if (ev.status === 'exit') ph.status = 'done';
+          else ph.status = ev.status;
+        }
+        if (typeof ev.duration_ms === 'number') ph.duration_ms = ev.duration_ms;
+        if (ev.ts) {
+          if (ev.status === 'enter') ph.started_at = ev.ts;
+          if (ev.status === 'exit') ph.finished_at = ev.ts;
+        }
+        phases[ev.phase] = ph;
+        t.phases = phases;
+        if (ev.status === 'enter') t.current_phase = ev.phase;
+      }
+      t.last_updated = ev.ts || t.last_updated || Math.floor(Date.now() / 1000);
+      next[ev.task_id] = t;
+      return next;
+    });
   };
 
   const handleAddPath = (e: React.FormEvent) => {
     e.preventDefault();
     if (newPathInput.trim()) {
-      onAddPath(newPathInput);
+      onAddPath(newPathInput, newPathType);
       setNewPathInput('');
     }
   };
 
-  // Load TMDB credentials status once
-  React.useEffect(() => {
-    (async () => {
+  useEffect(() => {
+    let active = true;
+    const tick = async () => {
       try {
-        const s = await (await import('../../services/api')).MediaService.getCredentialsStatus();
+        const s = await MediaService.getCredentialsStatus();
+        if (!active) return;
         setTmdbConfigured(!!s.tmdb_configured);
-      } catch (e) {
+      } catch {
+        if (!active) return;
         setTmdbConfigured(false);
       }
+    };
+    void tick();
+    const id = window.setInterval(() => void tick(), 5000);
+    return () => {
+      active = false;
+      window.clearInterval(id);
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      try {
+        const cfg = await MediaService.getAppConfig();
+        if (!active) return;
+        let rateFromCfg: number | null = null;
+        let batchFromCfg: number | null = null;
+        if (cfg && typeof (cfg as any).jikan_fetch_episodes !== 'undefined') {
+          setJikanFetchEpisodes(!!(cfg as any).jikan_fetch_episodes);
+        }
+        if (cfg && typeof (cfg as any).enrichment_rate_per_min !== 'undefined') {
+          const v = Number((cfg as any).enrichment_rate_per_min);
+          if (Number.isFinite(v) && v > 0) {
+            rateFromCfg = v;
+            setEnrichRatePerMin(String(v));
+          }
+        }
+        if (cfg && typeof (cfg as any).enrichment_batch_size !== 'undefined') {
+          const v = Number((cfg as any).enrichment_batch_size);
+          if (Number.isFinite(v) && v > 0) {
+            batchFromCfg = v;
+            setEnrichBatchSize(String(v));
+          }
+        }
+        if (rateFromCfg !== null || batchFromCfg !== null) {
+          const rate = (rateFromCfg ?? Number(enrichRatePerMin)) || 60;
+          const batch = (batchFromCfg ?? Number(enrichBatchSize)) || 20;
+          if (rate >= 120 || batch >= 40) setEnrichPreset('fast');
+          else if (rate <= 60 && batch <= 20) setEnrichPreset('safe');
+          else setEnrichPreset('balanced');
+        }
+      } catch {}
     })();
+    return () => { active = false; };
   }, []);
 
   const refreshSystemInfo = async () => {
     try {
-      const api = await import('../../services/api');
-      const h = await api.MediaService.getHealth();
+      const h = await MediaService.getHealth();
       setHealth(h || null);
     } catch {
       setHealth(null);
@@ -179,30 +262,35 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   const refreshLogs = async () => {
     try {
-      const api = await import('../../services/api');
-      const t = await api.MediaService.getLogsTail(250);
+      const t = await MediaService.getLogsTail(250);
       setLogsTail(t || null);
     } catch {
       setLogsTail({ path: '', lines: [], error: 'failed' });
     }
   };
 
-  // Track enrichment events and build a lightweight history/log for realtime UI
   useEffect(() => {
-    // keep local liveEnrichment in sync with prop when provided
+    void refreshSystemInfo();
+    if (activeTab === 'control') void refreshLogs();
+    const id = window.setInterval(() => {
+      void refreshSystemInfo();
+      if (activeTab === 'control') void refreshLogs();
+    }, activeTab === 'control' ? 10000 : 15000);
+    return () => window.clearInterval(id);
+  }, [activeTab]);
+
+
+  useEffect(() => {
     if (!enrichment) return;
     setLiveEnrichment(prev => ({ ...(prev || {}), ...(enrichment || {}) }));
     if (livePaused) return;
     try {
       const now = Date.now();
-      // detect current id changes (processing new item)
       const curId = enrichment.current_id ? Number(enrichment.current_id) : null;
       if (curId && curId !== prevCurrentId.current) {
         prevCurrentId.current = curId;
         setEnrichHistory(h => [{ type: 'processing', id: curId, title: enrichment.current_title || null, ts: now }, ...h].slice(0, 200));
       }
-
-      // detect ingestion by seeing pending decrease
       if (typeof enrichment.pending === 'number') {
         const p = Number(enrichment.pending);
         if (prevPending.current != null && p < prevPending.current) {
@@ -211,39 +299,18 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         }
         prevPending.current = p;
       }
-    } catch (e) {
-      // ignore
-    }
+    } catch {}
   }, [enrichment, livePaused]);
 
-  // Poll backend enrich status when component mounts and while not paused
   useEffect(() => {
     let mounted = true;
     const startPolling = async () => {
       try {
-        const api = (await import('../../services/api')).MediaService;
         const fetchOnce = async () => {
           try {
-            const data = await api.getEnrichStatus();
+            const data = await MediaService.getEnrichStatus();
             if (!mounted) return;
-            // merge to avoid wiping unchanged fields (reduce UI flicker)
             setLiveEnrichment(prev => ({ ...(prev || {}), ...(data || {}) }));
-
-            try {
-              const loc = await api.getLocalizeStatus();
-              if (mounted) {
-                const normalizedLoc = loc ? { ...loc } : null;
-                if (normalizedLoc && normalizedLoc.running !== true) {
-                  normalizedLoc.current_title = null;
-                  normalizedLoc.current_step = 'idle';
-                }
-                setLocalize(normalizedLoc);
-              }
-            } catch (e) {
-              // ignore
-            }
-
-            // update history based on change in pending / current_id
             const now = Date.now();
             const curId = data.current_id ? Number(data.current_id) : null;
             if (curId && curId !== prevCurrentId.current) {
@@ -258,80 +325,106 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               }
               prevPending.current = p;
             }
-          } catch (e) {
-            // silent
-          }
+          } catch {}
         };
-
-        // initial fetch
         await fetchOnce();
-        // clear any existing interval
-        if (pollRef.current) {
-          window.clearInterval(pollRef.current);
-          pollRef.current = null;
-        }
+        if (pollRef.current) window.clearInterval(pollRef.current);
         pollRef.current = window.setInterval(() => {
-          if (livePaused) return;
-          void fetchOnce();
-        }, 2000) as unknown as number;
-      } catch (e) {
-        // ignore dynamic import errors
-      }
+          if (!livePaused) void fetchOnce();
+        }, 2000) as any;
+      } catch {}
     };
-
     startPolling();
     return () => {
       mounted = false;
-      if (pollRef.current) {
-        window.clearInterval(pollRef.current);
-        pollRef.current = null;
-      }
+      if (pollRef.current) window.clearInterval(pollRef.current);
     };
   }, [livePaused]);
+
+  useEffect(() => {
+    let stopped = false;
+    let es: EventSource | null = null;
+    let attempt = 0;
+    const connect = async () => {
+      try {
+        const urls = MediaService.getTelemetrySseUrls();
+        if (!urls.length) { setTelemetryConnected(false); return; }
+        es = new EventSource(urls[attempt % urls.length]);
+        es.onopen = () => setTelemetryConnected(true);
+        es.onerror = () => {
+          setTelemetryConnected(false);
+          try { es?.close(); } catch {}
+          attempt++;
+          if (!stopped) window.setTimeout(connect, 2000);
+        };
+        const handle = (event: MessageEvent) => {
+          if (!event?.data) return;
+          let data: any = null;
+          try { data = JSON.parse(event.data); } catch { return; }
+          const type = data?.type || event.type || 'message';
+          if (type === 'snapshot') {
+            const tasks = Array.isArray(data?.tasks) ? data.tasks : [];
+            const map: Record<string, TelemetryTask> = {};
+            for (const t of tasks) if (t && t.task_id) map[t.task_id] = t as TelemetryTask;
+            setTelemetryTasks(map);
+            if (Array.isArray(data?.logs)) setLogEvents(data.logs.slice().reverse());
+            return;
+          }
+          const ev: TelemetryEvent = { ...(data || {}), type };
+          if (type === 'log') setLogEvents(prev => [ev, ...(prev || [])].slice(0, 300));
+          if (type === 'provider_http' || type === 'api.timing') setApiEvents(prev => [ev, ...(prev || [])].slice(0, 120));
+          if (ev.task_id) applyTelemetryEvent(ev);
+        };
+        es.addEventListener('snapshot', handle as any);
+        es.addEventListener('task.phase', handle as any);
+        es.addEventListener('task.start', handle as any);
+        es.addEventListener('task.end', handle as any);
+        es.addEventListener('task.queued', handle as any);
+        es.addEventListener('log', handle as any);
+        es.addEventListener('provider_http', handle as any);
+        es.addEventListener('api.timing', handle as any);
+        es.onmessage = handle as any;
+      } catch { setTelemetryConnected(false); }
+    };
+    connect();
+    return () => { stopped = true; try { es?.close(); } catch {} setTelemetryConnected(false); };
+  }, []);
+
+  useEffect(() => {
+    if (activeTab !== 'control') return;
+    void runControlSearch();
+    void loadConflicts();
+  }, [activeTab]);
 
   const handleTestTmdb = async () => {
     setTmdbTestResult('testing');
     try {
-      const r = await (await import('../../services/api')).MediaService.getCredentialsCheck();
+      const r = await MediaService.getCredentialsCheck();
       if (r.ok) setTmdbTestResult('ok');
       else setTmdbTestResult(r.detail || 'failed');
-    } catch (e) {
-      setTmdbTestResult(String(e));
-    }
-    // refresh configured status after test
+    } catch (e) { setTmdbTestResult(String(e)); }
     try {
-      const s = await (await import('../../services/api')).MediaService.getCredentialsStatus();
+      const s = await MediaService.getCredentialsStatus();
       setTmdbConfigured(!!s.tmdb_configured);
-    } catch (e) { }
-  };
-
-  const normalizeBearerToken = (raw: string) => {
-    const t = (raw || '').trim();
-    if (!t) return '';
-    return t.toLowerCase().startsWith('bearer ') ? t.slice(7).trim() : t;
+    } catch {}
   };
 
   const buildTmdbPayload = () => {
     const payload: any = { tmdb_use_v4: !!tmdbUseV4 };
     const key = (tmdbApiKeyInput || '').trim();
-    const token = normalizeBearerToken(tmdbAccessTokenInput || '');
+    const token = (tmdbAccessTokenInput || '').trim();
     if (key) payload.tmdb_api_key = key;
-    if (token) payload.tmdb_access_token = token;
+    if (token) payload.tmdb_access_token = token.toLowerCase().startsWith('bearer ') ? token.slice(7).trim() : token;
     return payload;
   };
 
   const handleRetryNoMatch = async () => {
     try {
-      const api = (await import('../../services/api')).MediaService;
-      const r = await api.resetNoMatch();
+      const api = MediaService;
+      const r = await api.resetNoMatchWithOptions({ animeProvider: retryProviderMode, start: true });
       try {
         const resetCount = Number((r as any)?.data?.reset ?? 0);
         setEnrichHistory(h => [{ type: 'reset_no_match', count: resetCount, ts: Date.now() }, ...h].slice(0, 200));
-      } catch (e) {
-        // ignore
-      }
-      try {
-        await api.startEnrichment();
       } catch (e) {
         // ignore
       }
@@ -346,972 +439,593 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
   };
 
-  const handleFinalizeLocalization = async () => {
-    setFinalizeMsg(null);
-    setFinalizeBusy(true);
+  const handleRetryError = async () => {
     try {
-      const api = (await import('../../services/api')).MediaService;
-      const r = await api.startLocalization();
-      if (r && r.ok) {
-        setFinalizeMsg(t('process_started_ok'));
-      } else {
-        setFinalizeMsg((r as any)?.data?.detail || (r as any)?.error || t('process_failed'));
-      }
+      const api = MediaService;
+      const r = await api.resetError({ animeProvider: retryProviderMode, start: true });
+      try {
+        const resetCount = Number((r as any)?.data?.reset ?? 0);
+        setEnrichHistory(h => [{ type: 'reset_error', count: resetCount, ts: Date.now() }, ...h].slice(0, 200));
+      } catch {}
       try {
         const data = await api.getEnrichStatus();
         setLiveEnrichment(prev => ({ ...(prev || {}), ...(data || {}) }));
-      } catch (e) {
-        // ignore
-      }
-    } catch (e) {
-      setFinalizeMsg(String(e));
-    } finally {
-      setFinalizeBusy(false);
+      } catch {}
+    } catch {}
+  };
+
+  const handleSaveEnrichTuning = async (override?: { rate?: number; batch?: number; jikan?: boolean }) => {
+    setEnrichTuningMsg(null);
+    setEnrichTuningBusy(true);
+    try {
+      const cfg = await MediaService.getAppConfig();
+      const rate = Math.max(10, Math.min(300, Math.floor(Number(override?.rate ?? enrichRatePerMin) || 60)));
+      const batch = Math.max(5, Math.min(200, Math.floor(Number(override?.batch ?? enrichBatchSize) || 20)));
+      const jikan = typeof override?.jikan === 'boolean' ? override.jikan : !!jikanFetchEpisodes;
+      await MediaService.saveAppConfig({ ...(cfg || {}), jikan_fetch_episodes: jikan, enrichment_rate_per_min: rate, enrichment_batch_size: batch });
+      setEnrichRatePerMin(String(rate));
+      setEnrichBatchSize(String(batch));
+      setJikanFetchEpisodes(jikan);
+      setEnrichTuningMsg(t('saved'));
+    } catch { setEnrichTuningMsg(t('process_failed')); }
+    finally { setEnrichTuningBusy(false); }
+  };
+
+  const applyEnrichPreset = async (pId: 'safe' | 'balanced' | 'fast') => {
+    const presets: Record<string, { rate: number; batch: number; jikan: boolean }> = {
+      safe: { rate: 60, batch: 20, jikan: false },
+      balanced: { rate: 90, batch: 30, jikan: false },
+      fast: { rate: 120, batch: 40, jikan: false },
+    };
+    const p = presets[pId];
+    setEnrichPreset(pId);
+    setEnrichRatePerMin(String(p.rate));
+    setEnrichBatchSize(String(p.batch));
+    setJikanFetchEpisodes(p.jikan);
+    await handleSaveEnrichTuning(p);
+  };
+
+  const runControlSearch = async (q?: string) => {
+    setControlLoading(true); setControlError(null);
+    try {
+      const res = await MediaService.searchEntities(q !== undefined ? q : controlQuery, 50, 0);
+      setControlResults(Array.isArray(res?.items) ? res.items : []);
+      setControlTotal(Number(res?.total || 0));
+    } catch (e) { setControlError(String(e)); }
+    finally { setControlLoading(false); }
+  };
+
+  const loadConflicts = async () => {
+    setConflictsLoading(true);
+    try {
+      const res = await MediaService.getConflicts('all');
+      setConflicts(res?.conflicts || null);
+    } catch { setConflicts(null); }
+    finally { setConflictsLoading(false); }
+  };
+
+  const handleDeepPurge = async (id: number) => {
+    if (!window.confirm(t('control_confirm_purge'))) return;
+    try {
+      await MediaService.deepPurgeEntity(id);
+      void runControlSearch(); void loadConflicts();
+    } catch (e) { setControlError(String(e)); }
+  };
+
+  const handleRematch = async (item: AdminEntityRow) => {
+    const tmdbId = window.prompt(t('control_tmdb_prompt'), String(item.tmdb_id || ''));
+    if (!tmdbId || !tmdbId.trim()) return;
+    const mediaType = window.prompt(t('control_media_type_prompt'), String(item.media_type || 'tv')) || undefined;
+    const seasonRaw = window.prompt(t('control_season_prompt'), '');
+    let seasonNumber: number | undefined = undefined;
+    if (seasonRaw && String(seasonRaw).trim()) {
+      const n = Number(seasonRaw); if (Number.isFinite(n)) seasonNumber = n;
     }
+    try {
+      await MediaService.rematchEntity(Number(item.id), { tmdb_id: tmdbId.trim(), media_type: mediaType?.trim(), season_number: seasonNumber });
+      void runControlSearch(); void loadConflicts();
+    } catch (e) { setControlError(String(e)); }
+  };
+
+  const handleMerge = async (groupKey: string) => {
+    const draft = mergeDrafts[groupKey];
+    if (!draft?.keepId || !draft?.dropId || draft.keepId === draft.dropId) return;
+    try {
+      await MediaService.mergeConflicts(draft.keepId, draft.dropId);
+      void loadConflicts(); void runControlSearch();
+    } catch (e) { setControlError(String(e)); }
   };
 
   const handleValidateTmdbCredentials = async () => {
     const payload = buildTmdbPayload();
-    if (!payload.tmdb_api_key && !payload.tmdb_access_token) {
-      setTmdbCredMsg(t('tmdb_enter_api_or_token'));
-      return;
-    }
-
-    setTmdbBusy('validating');
-    setTmdbCredMsg(null);
+    if (!payload.tmdb_api_key && !payload.tmdb_access_token) { setTmdbCredMsg(t('tmdb_enter_api_or_token')); return; }
+    setTmdbBusy('validating'); setTmdbCredMsg(null);
     try {
-      const r = await (await import('../../services/api')).MediaService.checkCredentials(payload);
-      if (r.ok) {
-        setTmdbCredMsg(t('tmdb_creds_valid'));
-        setTmdbTestResult('ok');
-      } else {
-        const msg = r.detail || 'failed';
-        setTmdbCredMsg(`${t('tmdb_validation_failed')}: ${msg}`);
-        setTmdbTestResult(msg);
-      }
-    } catch (e) {
-      setTmdbCredMsg(`${t('tmdb_validation_failed')}: ${String(e)}`);
-      setTmdbTestResult(String(e));
-    } finally {
+      const r = await MediaService.checkCredentials(payload);
+      if (r.ok) { setTmdbCredMsg(t('tmdb_creds_valid')); setTmdbTestResult('ok'); }
+      else { setTmdbCredMsg(`${t('tmdb_validation_failed')}: ${r.detail || 'failed'}`); setTmdbTestResult(r.detail || 'failed'); }
+    } catch (e) { setTmdbCredMsg(`${t('tmdb_validation_failed')}: ${String(e)}`); setTmdbTestResult(String(e)); }
+    finally {
       setTmdbBusy('idle');
-      try {
-        const s = await (await import('../../services/api')).MediaService.getCredentialsStatus();
-        setTmdbConfigured(!!s.tmdb_configured);
-      } catch (e) { }
+      try { const s = await MediaService.getCredentialsStatus(); setTmdbConfigured(!!s.tmdb_configured); } catch {}
     }
   };
 
   const handleSaveTmdbCredentials = async () => {
     const payload = buildTmdbPayload();
-    if (!payload.tmdb_api_key && !payload.tmdb_access_token && !payload.tmdb_use_v4) {
-    setTmdbCredMsg(t('nothing_to_save'));
-      return;
-    }
-
-    setTmdbBusy('saving');
-    setTmdbCredMsg(null);
+    if (!payload.tmdb_api_key && !payload.tmdb_access_token && !payload.tmdb_use_v4) { setTmdbCredMsg(t('nothing_to_save')); return; }
+    setTmdbBusy('saving'); setTmdbCredMsg(null);
     try {
-      const resp = await (await import('../../services/api')).MediaService.saveCredentials(payload);
-      if (resp && resp.saved) {
+      const resp = await MediaService.saveCredentials(payload);
+      if (resp?.saved) {
         if (resp.tmdb_ok) {
-          const started = resp.enrichment_started ? t('enrich_started') : t('enrich_already_running');
-          setTmdbCredMsg(`${t('saved_ok')} ${t('tmdb_ok')}. ${started}`);
-          setTmdbTestResult('ok');
-          setTmdbApiKeyInput('');
-          setTmdbAccessTokenInput('');
-          setShowTmdbSecrets(false);
-          setShowTmdbCredentials(false);
-        } else {
-          const msg = resp.detail || 'failed_check';
-          setTmdbCredMsg(`${t('tmdb_saved_but_check_failed')}: ${msg}`);
-          setTmdbTestResult(msg);
-        }
-      } else {
-        setTmdbCredMsg(t('tmdb_save_failed'));
-      }
-    } catch (e) {
-      setTmdbCredMsg(`${t('tmdb_save_failed')}: ${String(e)}`);
-    } finally {
+          setTmdbCredMsg(`${t('saved_ok')} ${t('tmdb_ok')}. ${resp.enrichment_started ? t('enrich_started') : t('enrich_already_running')}`);
+          setTmdbTestResult('ok'); setTmdbApiKeyInput(''); setTmdbAccessTokenInput(''); setShowTmdbSecrets(false); setShowTmdbCredentials(false);
+        } else { setTmdbCredMsg(`${t('tmdb_saved_but_check_failed')}: ${resp.detail || 'failed_check'}`); setTmdbTestResult(resp.detail || 'failed_check'); }
+      } else { setTmdbCredMsg(t('tmdb_save_failed')); }
+    } catch (e) { setTmdbCredMsg(`${t('tmdb_save_failed')}: ${String(e)}`); }
+    finally {
       setTmdbBusy('idle');
-      try {
-        const s = await (await import('../../services/api')).MediaService.getCredentialsStatus();
-        setTmdbConfigured(!!s.tmdb_configured);
-      } catch (e) { }
+      try { const s = await MediaService.getCredentialsStatus(); setTmdbConfigured(!!s.tmdb_configured); } catch {}
     }
   };
 
   const handleProfileSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!editingProfile?.name) return;
-
-    const pinRaw = String((editingProfile as any).pin || '').replace(/\D/g, '');
-    const pin = pinRaw ? pinRaw.slice(0, 6) : undefined;
+    const pin = String((editingProfile as any).pin || '').replace(/\D/g, '').slice(0, 6) || undefined;
     const isManager = !!(editingProfile as any).isManager && !(editingProfile as any).isKid;
-    if (isManager && (!pin || pin.length < 4)) {
-      window.alert(t('manager_pin_required_alert'));
-      return;
-    }
-    if (!isManager && pin && pin.length < 4) {
-      window.alert(t('pin_length_alert'));
-      return;
-    }
-
-    if (isCreatingProfile) {
-      onAddProfile({
-        name: editingProfile.name,
-        avatarColor: editingProfile.avatarColor || AVATAR_COLORS[0],
-        avatarImage: (editingProfile as any).avatarImage,
-        isKid: editingProfile.isKid || false,
-        isManager,
-        pin,
-        language: editingProfile.language || 'en-US'
-      });
-    } else if (editingProfile.id) {
-      onUpdateProfile({ ...(editingProfile as any), isManager, pin } as UserProfile);
-    }
-
-    setEditingProfile(null);
-    setIsCreatingProfile(false);
+    if (isManager && (!pin || pin.length < 4)) { window.alert(t('manager_pin_required_alert')); return; }
+    if (!isManager && pin && pin.length < 4) { window.alert(t('pin_length_alert')); return; }
+    if (isCreatingProfile) onAddProfile({ name: editingProfile.name, avatarColor: editingProfile.avatarColor || AVATAR_COLORS[0], avatarImage: (editingProfile as any).avatarImage, isKid: editingProfile.isKid || false, isManager, pin, language: editingProfile.language || 'en-US' });
+    else if (editingProfile.id) onUpdateProfile({ ...(editingProfile as any), isManager, pin } as UserProfile);
+    setEditingProfile(null); setIsCreatingProfile(false);
   };
 
   const startCreateProfile = () => {
-    setEditingProfile({
-      name: '',
-      avatarColor: AVATAR_COLORS[Math.floor(Math.random() * AVATAR_COLORS.length)],
-      isKid: false,
-      isManager: false,
-      pin: undefined,
-      language: 'en-US'
-    });
+    setEditingProfile({ name: '', avatarColor: AVATAR_COLORS[Math.floor(Math.random() * AVATAR_COLORS.length)], isKid: false, isManager: false, language: 'en-US' });
     setIsCreatingProfile(true);
   };
 
-  const startEditProfile = (profile: UserProfile) => {
-    setEditingProfile({ ...profile });
-    setIsCreatingProfile(false);
-  };
+  const startEditProfile = (profile: UserProfile) => { setEditingProfile({ ...profile }); setIsCreatingProfile(false); };
+
+  const telemetryTaskList = (Object.values(telemetryTasks) as TelemetryTask[]).sort((a, b) => Number(b.last_updated || 0) - Number(a.last_updated || 0)).slice(0, 10);
+  const telemetryTitleCounts = telemetryTaskList.reduce((acc, t) => { const key = (t.title || '').trim(); if (key) acc[key] = (acc[key] || 0) + 1; return acc; }, {} as Record<string, number>);
+  const filteredLogs = (logEvents || []).filter(ev => {
+    if (logFilter === 'error') { const lvl = String(ev.level || '').toUpperCase(); if (!lvl.includes('ERROR') && !lvl.includes('WARN')) return false; }
+    if (logTaskId && ev.task_id !== logTaskId) return false;
+    return true;
+  }).slice(0, 200);
+  const latestApiEvent = useMemo(
+    () => (apiEvents || []).find((ev) => !!String(ev.provider || ev.service || '').trim()) || null,
+    [apiEvents],
+  );
+  const configuredAnimeProvider = String(metadataConfig?.animeProvider || health?.provider_config?.anime || '').trim().toUpperCase() || null;
+  const currentApiProvider = useMemo(() => {
+    const step = String((enrich as any)?.current_step || '').trim().toLowerCase();
+    if (step.startsWith('search:')) return step.slice(7).toUpperCase();
+    const raw = String(latestApiEvent?.provider || latestApiEvent?.service || '').trim();
+    return raw ? raw.toUpperCase() : null;
+  }, [enrich, latestApiEvent]);
+  const kitsuHealth = health?.providers?.kitsu || null;
+  const jikanHealth = health?.providers?.jikan || null;
+  const recentApiActivity = useMemo(
+    () => (apiEvents || []).filter((ev) => ev.type === 'provider_http' || ev.type === 'api.timing').slice(0, 8),
+    [apiEvents],
+  );
 
   return (
-    <div className="max-w-6xl mx-auto py-8 px-4 sm:px-8 space-y-8 pb-32 animate-fade-in">
-      <div className="flex items-center justify-between mb-8">
-        <h1 className="text-3xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-white to-slate-400">
-          {t('settings_title')}
-        </h1>
-        <div className="flex items-center gap-3">
-          <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-800/50 border border-white/5">
-            <label className="text-xs font-semibold text-slate-400">{t('app_language')}</label>
-            <select
-              value={lang}
-              onChange={(e) => {
-                const v = String(e.target.value || '').toLowerCase();
-                if (v === 'es' || v === 'en') setLang(v, 'manual');
-              }}
-              className="bg-transparent text-sm text-slate-200 focus:outline-none cursor-pointer [&>option]:bg-[#1e293b]"
-              title={t('app_language_title')}
-            >
-              <option value="es">{t('spanish')}</option>
-              <option value="en">English</option>
-            </select>
+    <div className="max-w-7xl mx-auto py-10 px-4 sm:px-8 space-y-10 pb-32 animate-fade-in">
+      <div className="relative overflow-hidden rounded-3xl border border-white/5 bg-gradient-to-br from-[#0b1020] via-[#101826] to-[#0b0f1a] p-6 sm:p-8 shadow-[0_30px_80px_-50px_rgba(15,23,42,0.9)]">
+        <div className="absolute -top-24 right-0 h-48 w-48 rounded-full bg-gradient-to-br from-sky-500/30 via-cyan-500/10 to-transparent blur-3xl" />
+        <div className="absolute -bottom-32 left-0 h-56 w-56 rounded-full bg-gradient-to-br from-amber-500/20 via-orange-500/10 to-transparent blur-3xl" />
+        <div className="relative flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+          <div>
+            <div className="text-xs uppercase tracking-[0.4em] text-slate-500">{t('settings_title')}</div>
+            <h1 className="mt-2 text-3xl sm:text-4xl font-semibold text-white">
+              {t('settings_title')}
+            </h1>
+            <p className="mt-2 text-sm text-slate-400">
+              {t('system_status')}
+            </p>
           </div>
-          <Button size="sm" variant="ghost" onClick={() => setShowHelpModal(true)}>{t('help')}</Button>
-          <Button size="sm" onClick={() => onRefresh && onRefresh()} icon={<RefreshCw size={14} />}>{t('refresh')}</Button>
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="flex items-center gap-2 px-3 py-2 rounded-2xl bg-white/5 border border-white/10">
+              <label className="text-[11px] font-semibold text-slate-400 uppercase tracking-[0.2em]">{t('app_language')}</label>
+              <select value={lang} onChange={(e) => { const v = String(e.target.value || '').toLowerCase(); if (v === 'es' || v === 'en') setLang(v, 'manual'); }} className="bg-transparent text-sm text-slate-200 focus:outline-none cursor-pointer [&>option]:bg-[#0f172a]">
+                <option value="es">{t('spanish')}</option><option value="en">English</option>
+              </select>
+            </div>
+            <Button size="sm" variant="ghost" onClick={() => setShowHelpModal(true)}>{t('help')}</Button>
+            <Button size="sm" onClick={() => onRefresh && onRefresh()} icon={<RefreshCw size={14} />}>{t('refresh')}</Button>
+          </div>
         </div>
       </div>
 
-      {/* Top Section: Profiles */}
-      <div className="glass-panel p-6 rounded-2xl border border-white/5">
-        <div className="flex items-center justify-between mb-6">
-          <h2 className="text-xl font-semibold flex items-center text-indigo-100">
-            <Users className="mr-3 text-indigo-400" /> {t('profiles')}
-          </h2>
-          {!editingProfile && (
-            <Button size="sm" onClick={startCreateProfile} icon={<Plus size={16} />}>
-              {t('add_profile')}
-            </Button>
-          )}
-        </div>
+      <div className="flex flex-wrap items-center gap-3">
+        <button
+          onClick={() => setActiveTab('general')}
+          className={`px-5 py-2.5 rounded-full text-xs font-bold uppercase tracking-[0.25em] border transition-all ${activeTab === 'general' ? 'bg-gradient-to-r from-sky-500 to-cyan-500 text-slate-950 border-transparent shadow-lg shadow-cyan-500/20' : 'bg-white/5 text-slate-300 border-white/10 hover:border-white/30 hover:text-white'}`}
+        >
+          {t('general')}
+        </button>
+        <button
+          onClick={() => setActiveTab('control')}
+          className={`px-5 py-2.5 rounded-full text-xs font-bold uppercase tracking-[0.25em] border transition-all ${activeTab === 'control' ? 'bg-gradient-to-r from-amber-400 to-orange-500 text-slate-950 border-transparent shadow-lg shadow-orange-500/20' : 'bg-white/5 text-slate-300 border-white/10 hover:border-white/30 hover:text-white'}`}
+        >
+          {t('control_data')}
+        </button>
+      </div>
 
-        {editingProfile ? (
-          <form onSubmit={handleProfileSubmit} className="bg-slate-800/40 p-6 rounded-xl border border-white/5">
-            <h3 className="text-lg font-medium text-white mb-4">
-              {isCreatingProfile ? t('create_profile') : t('edit_profile')}
-            </h3>
-
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              <div className="space-y-4">
-                <div>
-                  <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">{t('name')}</label>
-                  <input
-                    type="text"
-                    value={editingProfile.name}
-                    onChange={e => setEditingProfile({ ...editingProfile, name: e.target.value })}
-                    className="w-full bg-slate-900/50 border border-white/10 rounded-lg px-4 py-2.5 text-sm text-white focus:ring-2 focus:ring-indigo-500 focus:border-transparent outline-none"
-                    placeholder={t('profile_name')}
-                    required
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">{t('language')}</label>
-                  <select
-                    value={editingProfile.language}
-                    onChange={e => setEditingProfile({ ...editingProfile, language: e.target.value })}
-                    className="w-full bg-slate-900/50 border border-white/10 rounded-lg px-4 py-2.5 text-sm text-white focus:ring-2 focus:ring-indigo-500 focus:border-transparent outline-none"
-                  >
-                    <option value="en-US">{t('english_us')}</option>
-                    <option value="es-ES">{t('spanish_mx')}</option>
-                  </select>
-                </div>
-
-                <div className="flex items-center space-x-3 pt-2">
-                  <input
-                    type="checkbox"
-                    id="isKid"
-                    checked={editingProfile.isKid}
-                    onChange={e => setEditingProfile({ ...editingProfile, isKid: e.target.checked, ...(e.target.checked ? { isManager: false } : {}) })}
-                    className="rounded border-slate-600 bg-slate-800 text-indigo-500 focus:ring-indigo-500"
-                  />
-                  <label htmlFor="isKid" className="text-sm text-slate-300">{t('kid_profile_restricted')}</label>
-                </div>
-
-                <div className="flex items-center space-x-3 pt-2">
-                  <input
-                    type="checkbox"
-                    id="isManager"
-                    checked={!!(editingProfile as any).isManager}
-                    onChange={e => setEditingProfile({ ...editingProfile, isManager: e.target.checked } as any)}
-                    disabled={!!(editingProfile as any).isKid}
-                    className="rounded border-slate-600 bg-slate-800 text-indigo-500 focus:ring-indigo-500 disabled:opacity-50"
-                  />
-                  <label htmlFor="isManager" className="text-sm text-slate-300">{t('manager_profile_access')}</label>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 mt-4">{t('pin_optional')}</label>
-                  <input
-                    type="password"
-                    inputMode="numeric"
-                    value={String((editingProfile as any).pin || '')}
-                    onChange={e => setEditingProfile({ ...editingProfile, pin: String(e.target.value || '').replace(/\\D/g, '').slice(0, 6) } as any)}
-                    className="w-full bg-slate-900/50 border border-white/10 rounded-lg px-4 py-2.5 text-sm text-white focus:ring-2 focus:ring-indigo-500 focus:border-transparent outline-none"
-                    placeholder={t('pin_digits_placeholder')}
-                  />
-                  <p className="text-xs text-slate-500 mt-2">{t('pin_optional_desc')}</p>
-                </div>
-              </div>
-
-              <div className="space-y-4">
-                <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">{t('avatar_color')}</label>
-                <div className="flex flex-wrap gap-3">
-                  {AVATAR_COLORS.map(color => (
-                    <button
-                      type="button"
-                      key={color}
-                      onClick={() => setEditingProfile({ ...editingProfile, avatarColor: color })}
-                      className={`w-10 h-10 rounded-full transition-all ${color} ${editingProfile.avatarColor === color ? 'ring-2 ring-white scale-110' : 'opacity-70 hover:opacity-100'}`}
+      <div className={activeTab === 'general' ? 'block' : 'hidden'}>
+        <div className="space-y-8">
+          {/* Profiles */}
+          <div className="rounded-3xl border border-white/10 bg-gradient-to-br from-[#0f172a]/80 via-[#101827]/80 to-[#0a0f1b]/90 p-6 shadow-[0_25px_60px_-40px_rgba(15,23,42,0.9)]">
+            <div className="flex items-center justify-between mb-6">
+              <h2 className="text-xl font-semibold flex items-center text-white"><Users className="mr-3 text-cyan-400" /> {t('profiles')}</h2>
+              {!editingProfile && <Button size="sm" onClick={startCreateProfile} icon={<Plus size={16} />}>{t('add_profile')}</Button>}
+            </div>
+            {editingProfile ? (
+              <form onSubmit={handleProfileSubmit} className="bg-black/30 p-6 rounded-2xl border border-white/10">
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                  <div className="lg:col-span-1 space-y-4">
+                    <div className="flex items-center gap-4">
+                      <div className={`w-20 h-20 rounded-2xl flex items-center justify-center overflow-hidden shadow-lg ${editingProfile.avatarColor || AVATAR_COLORS[0]}`}>
+                        {editingProfile.avatarImage ? (
+                          <img src={editingProfile.avatarImage} alt={editingProfile.name || 'avatar'} className="w-full h-full object-cover" />
+                        ) : (
+                          <span className="text-3xl font-bold text-white">{editingProfile.name?.[0] || '?'}</span>
+                        )}
+                      </div>
+                      <div className="flex-1">
+                        <label className="block text-xs font-semibold text-slate-400 uppercase tracking-[0.2em]">{t('photo_optional')}</label>
+                        <input
+                          type="file"
+                          accept="image/*"
+                          disabled={avatarBusy}
+                          onChange={async (e) => {
+                            const f = e.target.files && e.target.files[0];
+                            if (!f) return;
+                            setAvatarBusy(true);
+                            try {
+                              const reader = new FileReader();
+                              const dataUrl: string = await new Promise((resolve, reject) => {
+                                reader.onerror = () => reject(new Error('read_failed'));
+                                reader.onload = () => resolve(String(reader.result || ''));
+                                reader.readAsDataURL(f);
+                              });
+                              setEditingProfile({ ...(editingProfile || {}), avatarImage: dataUrl });
+                            } catch {
+                              // ignore
+                            } finally {
+                              setAvatarBusy(false);
+                              try { e.target.value = ''; } catch {}
+                            }
+                          }}
+                          className="mt-2 block w-full text-xs text-slate-300 file:mr-3 file:py-2 file:px-3 file:rounded-md file:border-0 file:bg-slate-800 file:text-slate-200 hover:file:bg-slate-700"
+                        />
+                        {!!editingProfile.avatarImage && (
+                          <button
+                            type="button"
+                            onClick={() => setEditingProfile({ ...(editingProfile || {}), avatarImage: undefined })}
+                            className="mt-2 px-3 py-1.5 text-xs text-slate-300 hover:text-white rounded-md border border-white/10 hover:bg-white/5 transition-colors"
+                          >
+                            {t('remove')}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-[11px] font-semibold text-slate-400 uppercase tracking-[0.2em]">{t('avatar_color')}</div>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        {AVATAR_COLORS.map((c) => (
+                          <button
+                            key={c}
+                            type="button"
+                            onClick={() => setEditingProfile({ ...(editingProfile || {}), avatarColor: c })}
+                            className={`h-7 w-7 rounded-lg border ${editingProfile.avatarColor === c ? 'border-cyan-400 ring-2 ring-cyan-400/30' : 'border-white/10'} ${c}`}
+                            aria-label={`avatar-${c}`}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="lg:col-span-2 space-y-4">
+                    <input
+                      type="text"
+                      value={editingProfile.name}
+                      onChange={e => setEditingProfile({ ...editingProfile, name: e.target.value })}
+                      className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-2.5 text-sm text-white focus:ring-2 focus:ring-cyan-500 outline-none"
+                      placeholder={t('profile_name')}
+                      required
                     />
+                    <select
+                      value={editingProfile.language}
+                      onChange={e => setEditingProfile({ ...editingProfile, language: e.target.value })}
+                      className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-2.5 text-sm text-white focus:ring-2 focus:ring-cyan-500 outline-none"
+                    >
+                      <option value="en-US">English (US)</option>
+                      <option value="es-ES">Espanol (MX)</option>
+                    </select>
+                    <div className="flex items-start gap-3 rounded-xl border border-white/10 bg-black/40 px-4 py-3">
+                      <input
+                        type="checkbox"
+                        checked={editingProfile.isKid}
+                        onChange={e => setEditingProfile({ ...editingProfile, isKid: e.target.checked, ...(e.target.checked ? { isManager: false } : {}) })}
+                        className="mt-1 rounded bg-slate-800 border-white/10"
+                      />
+                      <div>
+                        <div className="text-sm text-slate-200">{t('kid_profile_restricted')}</div>
+                      </div>
+                    </div>
+                    <div className="flex items-start gap-3 rounded-xl border border-white/10 bg-black/40 px-4 py-3">
+                      <input
+                        type="checkbox"
+                        checked={!!(editingProfile as any).isManager}
+                        onChange={e => setEditingProfile({ ...(editingProfile || {}), isManager: e.target.checked, ...(e.target.checked ? { isKid: false } : {}) })}
+                        className="mt-1 rounded bg-slate-800 border-white/10"
+                      />
+                      <div>
+                        <div className="text-sm text-slate-200">{t('manager_profile_access')}</div>
+                        <div className="text-xs text-slate-500">{t('pin_required_desc')}</div>
+                      </div>
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-xs font-semibold text-slate-400 uppercase tracking-[0.2em]">
+                        {(editingProfile as any).isManager ? t('pin_required') : t('pin_optional')}
+                      </label>
+                      <input
+                        type="password"
+                        inputMode="numeric"
+                        value={(editingProfile as any).pin || ''}
+                        onChange={e => {
+                          const v = String(e.target.value || '').replace(/\D/g, '').slice(0, 6);
+                          setEditingProfile({ ...(editingProfile || {}), pin: v });
+                        }}
+                        className="w-full bg-black/40 border border-white/10 rounded-xl px-4 py-2.5 text-sm text-white focus:ring-2 focus:ring-cyan-500 outline-none"
+                        placeholder={t('pin_digits_placeholder')}
+                      />
+                      <div className="text-xs text-slate-500">
+                        {(editingProfile as any).isManager ? t('pin_required_desc') : t('pin_optional_desc')}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div className="flex justify-end space-x-3 mt-8">
+                  <Button type="button" variant="ghost" onClick={() => setEditingProfile(null)}>{t('cancel')}</Button>
+                  <Button type="submit" icon={<Save size={16} />}>{t('save_profile')}</Button>
+                </div>
+              </form>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                {profiles.map(p => (
+                  <div key={p.id} className="bg-white/5 p-4 rounded-2xl border border-white/10 flex items-center justify-between group hover:border-cyan-400/40 hover:bg-white/10 transition-all">
+                    <div className="flex items-center space-x-3">
+                      <div className={`w-11 h-11 rounded-xl flex items-center justify-center overflow-hidden ${p.avatarColor}`}>{p.avatarImage ? <img src={p.avatarImage} alt={p.name} className="w-full h-full object-cover" /> : <span className="font-bold text-white">{p.name?.[0] || '?'}</span>}</div>
+                      <div><h4 className="font-medium text-white">{p.name}</h4><p className="text-xs text-slate-500">{p.isKid ? t('kids') : t('adult')} • {p.language}</p></div>
+                    </div>
+                    <div className="flex space-x-1 opacity-0 group-hover:opacity-100"><button onClick={() => startEditProfile(p)} className="p-1.5 hover:bg-white/10 rounded text-slate-400"><Pencil size={14} /></button><button onClick={() => onDeleteProfile(p.id)} className="p-1.5 hover:bg-red-500/10 rounded text-slate-400 hover:text-red-400" disabled={profiles.length <= 1}><Trash2 size={14} /></button></div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="grid grid-cols-1 xl:grid-cols-3 gap-8">
+            {/* Left Column: Storage & Paths */}
+            <div className="xl:col-span-2 space-y-8">
+              <div className="rounded-3xl border border-white/10 bg-gradient-to-br from-[#0c1424] via-[#0d1626] to-[#0a0f1b] p-6 shadow-[0_20px_60px_-45px_rgba(15,23,42,0.9)]">
+                <h2 className="text-xl font-semibold flex items-center mb-6 text-white"><HardDrive className="mr-3 text-cyan-400" /> {t('storage')}</h2>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {drives.map((d, i) => (
+                    <div key={i} className="bg-white/5 p-5 rounded-2xl border border-white/10">
+                      <div className="flex justify-between items-start mb-4"><div className="flex items-center"><div className="w-11 h-11 rounded-xl bg-gradient-to-br from-slate-700 to-slate-600 flex items-center justify-center mr-3 text-white font-bold">{String(d.path || d.label || '?').replace(':', '')}</div><div><p className="font-medium text-white">{d.label || t('local_disk')}</p><p className="text-xs text-slate-400 font-mono">{d.path}</p></div></div><div className="text-right"><p className="text-sm font-bold text-white">{Math.round((d.freeSpace || 0) / 1073741824)} GB</p><p className="text-[10px] text-slate-500 uppercase">{t('free_space')}</p></div></div>
+                      <div className="h-2 rounded-full bg-white/5 overflow-hidden"><div style={{ width: `${(d.totalSpace ? ((d.totalSpace - (d.freeSpace || 0)) / d.totalSpace) * 100 : 0)}%` }} className="h-full bg-gradient-to-r from-cyan-400 to-sky-500" /></div>
+                    </div>
                   ))}
                 </div>
+              </div>
 
-                <div className="mt-4 flex justify-center">
-                  <div className={`w-20 h-20 rounded-xl flex items-center justify-center shadow-lg overflow-hidden ${editingProfile.avatarColor}`}>
-                    {(editingProfile as any).avatarImage ? (
-                      <img src={(editingProfile as any).avatarImage} alt={editingProfile.name || 'avatar'} className="w-full h-full object-cover" />
-                    ) : (
-                      <span className="text-2xl font-bold text-white">{editingProfile.name?.[0] || '?'}</span>
-                    )}
-                  </div>
-                </div>
-
-                <div className="mt-4 flex items-center justify-center gap-3">
-                  <label className="text-xs text-slate-400">
-                    {t('photo_optional')}
-                    <input
-                      type="file"
-                      accept="image/*"
-                      onChange={async (e) => {
-                        const f = e.target.files && e.target.files[0];
-                        if (!f) return;
-                        try {
-                          const reader = new FileReader();
-                          const dataUrl: string = await new Promise((resolve, reject) => {
-                            reader.onerror = () => reject(new Error('read_failed'));
-                            reader.onload = () => resolve(String(reader.result || ''));
-                            reader.readAsDataURL(f);
-                          });
-                          setEditingProfile({ ...editingProfile, avatarImage: dataUrl } as any);
-                        } catch (err) {
-                          // ignore
-                        } finally {
-                          try { e.target.value = ''; } catch { }
-                        }
-                      }}
-                      className="block mt-2 text-[11px] text-slate-300 file:mr-3 file:py-2 file:px-3 file:rounded-md file:border-0 file:bg-slate-800 file:text-slate-200 hover:file:bg-slate-700"
-                    />
-                  </label>
-                  {(editingProfile as any).avatarImage ? (
-                    <button
-                      type="button"
-                      onClick={() => setEditingProfile({ ...editingProfile, avatarImage: undefined } as any)}
-                      className="px-3 py-2 text-[11px] text-slate-300 hover:text-white rounded-md border border-white/10 hover:bg-white/5 transition-colors self-end"
-                    >
-                      Quitar
-                    </button>
-                  ) : null}
+              <div className="rounded-3xl border border-white/10 bg-gradient-to-br from-[#0b1220] via-[#0f172a] to-[#0b1220] p-6 shadow-[0_20px_60px_-45px_rgba(15,23,42,0.9)]">
+                <h2 className="text-xl font-semibold flex items-center mb-6 text-white"><FolderPlusIcon className="mr-3 text-cyan-400" /> {t('library_folders')}</h2>
+                <form onSubmit={handleAddPath} className="flex flex-wrap gap-3 mb-6"><input type="text" value={newPathInput} onChange={e => setNewPathInput(e.target.value)} placeholder={t('library_path_placeholder')} className="flex-1 min-w-[220px] bg-black/40 border border-white/10 rounded-xl px-4 py-2.5 text-sm text-white focus:ring-2 focus:ring-cyan-500 outline-none" /><Button type="button" variant="ghost" onClick={() => setShowFolderPicker(true)} icon={<FolderPlus size={16} />}>{t('browse')}</Button><Button type="submit" disabled={!newPathInput.trim()} icon={<Plus size={16} />}>{t('add')}</Button></form>
+                <FolderPickerModal open={showFolderPicker} onClose={() => setShowFolderPicker(false)} onConfirm={paths => { for (const p of paths || []) onAddPath(p, newPathType); setShowFolderPicker(false); }} />
+                <div className="space-y-2">
+                  {libraryPaths.map((p) => (
+                    <div key={p} className="flex items-center justify-between p-4 bg-white/5 rounded-2xl border border-white/10 group hover:border-cyan-400/40 hover:bg-white/10 transition-all">
+                      <div className="flex items-center min-w-0"><FolderPlusIcon size={16} className="text-slate-400 mr-3" /><span className="text-sm text-slate-200 font-mono truncate">{p}</span></div>
+                      <button onClick={() => onRemovePath(p)} className="text-slate-500 hover:text-red-400 p-2"><Trash2 size={16} /></button>
+                    </div>
+                  ))}
                 </div>
               </div>
             </div>
 
-            <div className="flex justify-end space-x-3 mt-8">
-              <Button type="button" variant="ghost" onClick={() => setEditingProfile(null)}>{t('cancel')}</Button>
-              <Button type="submit" icon={<Save size={16} />}>{t('save_profile')}</Button>
-            </div>
-          </form>
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-            {profiles.map(profile => (
-              <div key={profile.id} className="bg-slate-800/30 p-4 rounded-xl border border-white/5 flex items-center justify-between group hover:bg-slate-800/50 transition-colors">
-                <div className="flex items-center space-x-3">
-                  <div className={`w-10 h-10 rounded-lg flex items-center justify-center overflow-hidden ${profile.avatarColor}`}>
-                    {profile.avatarImage ? (
-                      <img src={profile.avatarImage} alt={profile.name} className="w-full h-full object-cover" loading="lazy" />
-                    ) : (
-                      <span className="font-bold text-white">
-                        {profile?.name?.[0] || (profile?.name ? profile.name.charAt(0) : '?')}
-                      </span>
-                    )}
-                  </div>
-                  <div>
-                    <h4 className="font-medium text-white">{profile.name}</h4>
-                    <p className="text-xs text-slate-500">{profile.isKid ? t('kids') : t('adult')} • {profile.language}</p>
-                  </div>
-                </div>
-                <div className="flex space-x-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                  <button
-                    onClick={() => startEditProfile(profile)}
-                    className="p-1.5 hover:bg-white/10 rounded text-slate-400 hover:text-white"
-                  >
-                    <Pencil size={14} />
-                  </button>
-                  <button
-                    onClick={() => onDeleteProfile(profile.id)}
-                    className="p-1.5 hover:bg-red-500/10 rounded text-slate-400 hover:text-red-400"
-                    disabled={profiles.length <= 1} // Prevent deleting last profile
-                  >
-                    <Trash2 size={14} />
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-8">
-
-        {/* Left Column: Storage & Paths */}
-        <div className="xl:col-span-2 space-y-8">
-
-          {/* Storage Drives */}
-          <div className="glass-panel p-6 rounded-2xl border border-white/5">
-            <h2 className="text-xl font-semibold flex items-center mb-6 text-indigo-100">
-              <HardDrive className="mr-3 text-indigo-400" /> {t('storage')}
-            </h2>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {drives.map((drive, idx) => {
-                const totalSpace = drive.totalSpace || 0;
-                const freeSpace = drive.freeSpace || 0;
-                const usedSpace = Math.max(0, totalSpace - freeSpace);
-                const percentage = totalSpace > 0 ? (usedSpace / totalSpace) * 100 : 0;
-                const displayPath = (drive.path || drive.label || t('unknown')).toString();
-
-                return (
-                  <div key={idx} className="bg-slate-800/40 p-5 rounded-xl border border-white/5 hover:bg-slate-800/60 transition-colors">
-                    <div className="flex justify-between items-start mb-4">
-                      <div className="flex items-center">
-                        <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-slate-700 to-slate-600 flex items-center justify-center mr-3 shadow-lg">
-                          <span className="text-sm font-bold text-white">{displayPath.replace(':', '')}</span>
-                        </div>
-                        <div>
-                          <p className="font-medium text-white">{drive.label || t('local_disk')}</p>
-                          <p className="text-xs text-slate-400 font-mono">{drive.path || displayPath}</p>
-                        </div>
-                      </div>
-                      <div className="text-right">
-                        <p className="text-sm font-bold text-white">
-                          {Math.round(freeSpace / 1073741824)} GB
-                        </p>
-                        <p className="text-[10px] uppercase tracking-wider text-slate-500">{t('free_space')}</p>
-                      </div>
-                    </div>
-
-                    <div className="relative pt-1">
-                      <div className="flex mb-2 items-center justify-between">
-                        <div className="text-right w-full">
-                          <span className="text-xs font-semibold inline-block text-indigo-300">
-                            {t('free_percent').replace('{percent}', percentage.toFixed(1))}
-                          </span>
-                        </div>
-                      </div>
-                      <div className="overflow-hidden h-2 mb-4 text-xs flex rounded-full bg-slate-700/50">
-                        <div
-                          style={{ width: `${percentage}%` }}
-                          className={`shadow-none flex flex-col text-center whitespace-nowrap text-white justify-center transition-all duration-700 ${percentage > 90 ? 'bg-gradient-to-r from-red-500 to-orange-500' : 'bg-gradient-to-r from-indigo-500 to-blue-500'}`}
-                        />
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-
-          {/* Library Paths */}
-          <div className="glass-panel p-6 rounded-2xl border border-white/5">
-            <h2 className="text-xl font-semibold flex items-center mb-6 text-indigo-100">
-              <FolderPlus className="mr-3 text-indigo-400" /> {t('library_folders')}
-            </h2>
-
-            <form onSubmit={handleAddPath} className="flex gap-3 mb-6">
-              <input
-                type="text"
-                value={newPathInput}
-                onChange={(e) => setNewPathInput(e.target.value)}
-                placeholder={t('library_path_placeholder')}
-                className="flex-1 bg-slate-900/50 border border-white/10 rounded-lg px-4 py-2.5 text-sm text-white focus:ring-2 focus:ring-indigo-500 focus:border-transparent outline-none transition-all placeholder-slate-600"
+            {/* Right Column: Scan & Metadata Dashboard */}
+            <div className="space-y-8">
+          <SystemStatusDashboard
+            scanStatus={scanStatus}
+            enrich={enrich}
+            migrationRunning={!!migrationRunning}
+            isAdmin={true}
+            activeProviderLabel={currentApiProvider}
+            configuredAnimeProvider={configuredAnimeProvider}
+            scanItemsTotal={scanItemsTotal}
+            onStartScan={onStartScan}
+            onStartEnrich={onStartEnrich}
+            onRetryNoMatch={handleRetryNoMatch}
+            onRetryError={handleRetryError}
+            retryMode={retryProviderMode}
+            onChangeRetryMode={setRetryProviderMode}
+            setShowSystemLogs={setShowSystemLogs}
+            setShowNoMatchModal={setShowNoMatchModal}
+          />
+              <MetadataProviderConfig
+                tmdbConfigured={tmdbConfigured} animeProvider={metadataConfig.animeProvider} kitsuStatus={kitsuHealth}
+                showTmdbCredentials={showTmdbCredentials} setShowTmdbCredentials={setShowTmdbCredentials} setTmdbCredMsg={setTmdbCredMsg}
+                showTmdbSecrets={showTmdbSecrets} setShowTmdbSecrets={setShowTmdbSecrets} tmdbApiKeyInput={tmdbApiKeyInput} setTmdbApiKeyInput={setTmdbApiKeyInput}
+                tmdbAccessTokenInput={tmdbAccessTokenInput} setTmdbAccessTokenInput={setTmdbAccessTokenInput} tmdbUseV4={tmdbUseV4} setTmdbUseV4={setTmdbUseV4}
+                tmdbBusy={tmdbBusy} handleValidateTmdbCredentials={handleValidateTmdbCredentials} handleSaveTmdbCredentials={handleSaveTmdbCredentials} tmdbCredMsg={tmdbCredMsg}
               />
-              <Button type="button" variant="ghost" onClick={() => setShowFolderPicker(true)} icon={<FolderPlus size={16} />}>
-                {t('browse')}
-              </Button>
-              <Button type="submit" disabled={!newPathInput.trim()} icon={<Plus size={16} />}>
-                {t('add')}
-              </Button>
-            </form>
-
-            <FolderPickerModal
-              open={showFolderPicker}
-              onClose={() => setShowFolderPicker(false)}
-              onConfirm={(paths) => {
-                try {
-                  for (const p of paths || []) onAddPath(p);
-                } finally {
-                  setShowFolderPicker(false);
-                }
-              }}
-            />
-
-            <div className="space-y-2">
-              {libraryPaths.length === 0 ? (
-                <div className="text-center py-10 border border-dashed border-slate-700 rounded-xl bg-slate-800/20">
-                  <FolderPlus className="mx-auto h-10 w-10 text-slate-600 mb-3" />
-                  <p className="text-slate-400 font-medium">{t('no_watch_folders')}</p>
-                  <p className="text-xs text-slate-500 mt-1">{t('add_directory_to_scan')}</p>
-                </div>
-              ) : (
-                libraryPaths.map((path, idx) => (
-                  <div key={idx} className="flex items-center justify-between p-4 bg-slate-800/30 rounded-xl group hover:bg-slate-800/50 border border-transparent hover:border-white/5 transition-all">
-                    <div className="flex items-center overflow-hidden">
-                      <div className="w-8 h-8 rounded bg-slate-700/50 flex items-center justify-center mr-3 shrink-0 text-slate-400">
-                        <FolderPlus size={16} />
-                      </div>
-                      <span className="text-sm text-slate-200 font-mono truncate">{path}</span>
-                    </div>
-                    <button
-                      onClick={() => onRemovePath(path)}
-                      className="text-slate-500 hover:text-red-400 hover:bg-red-500/10 p-2 rounded-lg transition-colors"
-                      title={t('remove_path')}
-                    >
-                      <Trash2 size={16} />
-                    </button>
-                  </div>
-                ))
-              )}
+              <ActivityFeed enrich={enrich} livePaused={livePaused} setLivePaused={setLivePaused} enrichHistory={enrichHistory} />
+              <EnrichmentTuning
+                enrich={enrich} enrichTuningBusy={enrichTuningBusy} handleSaveEnrichTuning={handleSaveEnrichTuning}
+                enrichPreset={enrichPreset} setEnrichPreset={setEnrichPreset} applyEnrichPreset={applyEnrichPreset}
+                jikanFetchEpisodes={jikanFetchEpisodes} setJikanFetchEpisodes={setJikanFetchEpisodes}
+              />
             </div>
-          </div>
-
-          {/* System */}
-          <div className="glass-panel p-6 rounded-2xl border border-white/5">
-            <h2 className="text-xl font-semibold flex items-center mb-6 text-indigo-100">
-              <Database className="mr-3 text-indigo-400" /> {t('system')}
-            </h2>
-
-            <div className="flex flex-wrap gap-3">
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() => { void refreshSystemInfo(); }}
-                icon={<RefreshCw size={14} />}
-              >
-                {t('test_status')}
-              </Button>
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() => { setShowSystemLogs(true); void refreshLogs(); }}
-                icon={<ScanLine size={14} />}
-              >
-                {t('view_logs')}
-              </Button>
-              <Button
-                size="sm"
-                onClick={() => {
-                  void (async () => {
-                    const api = await import('../../services/api');
-                    api.MediaService.downloadBackup();
-                  })();
-                }}
-                icon={<Save size={14} />}
-              >
-                {t('download_backup')}
-              </Button>
-            </div>
-
-            {health ? (
-              <div className="mt-4 rounded-xl border border-white/10 bg-slate-900/40 p-4 text-xs text-slate-300">
-                <div className="flex items-center justify-between">
-                  <div className="font-semibold text-white">{t('status')}</div>
-                  <div className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${health.ok ? 'bg-emerald-500/15 text-emerald-300' : 'bg-red-500/15 text-red-300'}`}>
-                    {health.ok ? t('ok') : t('error')}
-                  </div>
-                </div>
-                <div className="mt-2 grid grid-cols-1 md:grid-cols-2 gap-2">
-                  <div><span className="text-slate-500">DB:</span> {health.db_ok ? t('ok') : (health.db_detail || t('error'))}</div>
-                  <div><span className="text-slate-500">Data:</span> <span className="font-mono">{health.data_dir}</span></div>
-                </div>
-              </div>
-            ) : null}
           </div>
         </div>
+      </div>
 
-        {/* Right Column: Scan & Metadata */}
-        <div className="space-y-8">
+      <div className={activeTab === 'control' ? 'block' : 'hidden'}>
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* Entity Search */}
+          <div className="rounded-3xl border border-white/10 bg-gradient-to-br from-[#0b1020] via-[#0f172a] to-[#0b1020] p-6 shadow-[0_20px_60px_-45px_rgba(15,23,42,0.9)]">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-xl font-semibold flex items-center text-white"><Database className="mr-3 text-amber-400" /> {t('control_data_title')}</h2>
+              <Button size="sm" variant="ghost" onClick={() => void runControlSearch()} icon={<RefreshCw size={14} />}>{t('refresh')}</Button>
+            </div>
+            <div className="mb-4 grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div className="rounded-2xl border border-white/10 bg-black/30 px-4 py-3">
+                <div className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-500">Anime Mode</div>
+                <div className="mt-1 text-sm font-semibold text-white">{configuredAnimeProvider || 'N/A'}</div>
+              </div>
+              <div className="rounded-2xl border border-cyan-500/15 bg-cyan-500/10 px-4 py-3">
+                <div className="text-[10px] font-black uppercase tracking-[0.2em] text-cyan-200/70">Active API</div>
+                <div className="mt-1 text-sm font-semibold text-cyan-100">{currentApiProvider || 'Idle'}</div>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-black/30 px-4 py-3">
+                <div className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-500">Kitsu API</div>
+                <div className={`mt-1 text-sm font-semibold ${kitsuHealth?.ok ? 'text-emerald-300' : 'text-red-300'}`}>
+                  {kitsuHealth == null ? 'Checking' : kitsuHealth.ok ? 'Online' : 'Unavailable'}
+                </div>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 mb-3"><input type="text" value={controlQuery} onChange={e => setControlQuery(e.target.value)} className="flex-1 bg-black/40 border border-white/10 rounded-xl px-3 py-2 text-sm text-white focus:ring-2 focus:ring-amber-400 outline-none" placeholder={t('search_placeholder')} /><Button size="sm" onClick={() => void runControlSearch()}>{t('search')}</Button></div>
+            <div className="space-y-2 max-h-72 overflow-auto">
+              {controlResults.map(item => (
+                <div key={String(item.id)} className="bg-white/5 p-3 rounded-xl border border-white/10 flex justify-between items-center">
+                  <div className="min-w-0"><div className="text-sm text-slate-100 font-medium truncate">{item.title || `#${item.id}`}</div><div className="text-[11px] text-slate-500">TMDB: {item.tmdb_id || '-'}</div></div>
+                  <div className="flex gap-2"><Button size="sm" variant="ghost" onClick={() => handleRematch(item)}>{t('control_rematch')}</Button><Button size="sm" variant="ghost" onClick={() => handleDeepPurge(Number(item.id))} icon={<Trash2 size={14} />} /></div>
+                </div>
+              ))}
+            </div>
+          </div>
 
-          {/* Scan Status */}
-          <div className="glass-panel p-6 rounded-2xl border border-white/5 relative overflow-hidden">
-            {scanStatus.scanning && (
-              <div className="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-transparent via-indigo-500 to-transparent animate-shimmer" />
-            )}
-
-            <div className="flex items-center justify-between mb-6">
-              <h2 className="text-xl font-semibold flex items-center text-indigo-100">
-                <ScanLine className={`mr-3 ${scanStatus.scanning ? 'text-indigo-400 animate-pulse' : 'text-slate-400'}`} />
-                {t('scanner')}
+          {/* Lenguaje / Anime */}
+          <div className="rounded-3xl border border-white/10 bg-gradient-to-br from-[#0b1020] via-[#0f172a] to-[#0b1020] p-6 shadow-[0_20px_60px_-45px_rgba(15,23,42,0.9)]">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-xl font-semibold flex items-center text-white">
+                <Languages className="mr-3 text-amber-400" /> Lenguaje (Anime)
               </h2>
             </div>
 
-            <div className="bg-slate-900/50 rounded-xl p-6 border border-white/5 mb-6">
-              {/* Migration banner */}
-              {migrationRunning ? (
-                <div className="mb-4 p-3 rounded-md bg-purple-800/40 border border-purple-700 text-sm text-purple-200">
-                  {t('migration_applying')}
-                </div>
-              ) : null}
-
-              {migrationError ? (
-                <div className="mb-4 p-3 rounded-md bg-red-800/40 border border-red-700 text-sm text-red-200">
-                  {t('migration_error')}: {migrationError}
-                </div>
-              ) : null}
-              <div className="flex justify-between items-end mb-3">
-                <span className="text-sm font-medium text-slate-300">
-                  {scanStatus.scanning ? t('processing_library') : t('system_idle')}
-                </span>
-                <span className="text-2xl font-bold text-white tabular-nums">{Math.round(computeScanProgress())}%</span>
-              </div>
-
-              <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden mb-4">
-                <div
-                  className="h-full bg-gradient-to-r from-indigo-500 to-purple-500 shadow-[0_0_10px_rgba(99,102,241,0.5)] transition-all duration-300 ease-out"
-                  style={{ width: `${computeScanProgress()}%` }}
-                />
-              </div>
-
-              <div className="flex items-start space-x-3 text-xs">
-                {scanStatus.scanning ? (
-                  <>
-                    <Loader2 className="animate-spin text-indigo-400 shrink-0 mt-0.5" size={14} />
-                    <div className="flex-1 overflow-hidden">
-                      <p className="text-indigo-300 font-medium">{t('current_task')}:</p>
-                      <p className="text-slate-400 font-mono mt-0.5 truncate" title={(scanStatus as any).current || scanStatus.currentFile}>
-                        {(scanStatus as any).current || scanStatus.currentFile || t('initializing')}
-                      </p>
-                      {typeof (scanStatus as any).processed === 'number' && typeof (scanStatus as any).total === 'number' ? (
-                        <p className="text-xs text-slate-400 mt-2">{(scanStatus as any).processed} / {(scanStatus as any).total} {t('files')}</p>
-                      ) : null}
+            <div className="space-y-4">
+                  <div className="bg-black/40 p-4 rounded-2xl border border-white/10">
+                    <div className="flex items-center justify-between">
+                      <div className="text-sm text-white font-semibold">Anime Normalize (Temporadas)</div>
+                      <span className={`text-[10px] font-black uppercase tracking-widest px-2 py-1 rounded-full border ${anRunning ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-300' : 'bg-white/5 border-white/10 text-slate-400'}`}>
+                        {anRunning ? 'Running' : 'Idle'}
+                      </span>
                     </div>
-                  </>
-                ) : (
-                  <p className="flex items-center text-slate-500">
-                    <CheckCircle size={14} className="mr-2 text-green-500" /> {t('last_scan_success')}
-                  </p>
-                )}
-              </div>
-            </div>
-
-            {/* Enrichment Status */}
-            <div className="bg-slate-900/30 rounded-xl p-4 border border-white/5 mb-4">
-              <div className="flex items-center justify-between mb-2">
-                <h3 className="text-sm font-medium text-indigo-100">{t('fetch_metadata')}</h3>
-                <div className="flex items-center gap-2 flex-wrap justify-end">
-                  <Button size="sm" onClick={() => onStartEnrich && onStartEnrich()} disabled={!!(enrich && enrich.running) || !!(localize && localize.running) || migrationRunning} icon={<RefreshCw size={14} />}>{t('force')}</Button>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    onClick={() => void handleFinalizeLocalization()}
-                    disabled={finalizeBusy || !!(enrich && enrich.running) || !!(localize && localize.running) || migrationRunning}
-                    icon={finalizeBusy ? <Loader2 className="animate-spin" size={14} /> : <Database size={14} />}
-                    title={t('tmdb_localize_title')}
-                  >
-                    {t('failsafe_es')}
-                  </Button>
-                  {enrich && typeof (enrich as any).no_match === 'number' && (enrich as any).no_match > 0 ? (
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={handleRetryNoMatch}
-                      disabled={!!(enrich && enrich.running) || !!(localize && localize.running) || migrationRunning}
-                    >
-                      {t('retry_no_match')} ({(enrich as any).no_match})
-                    </Button>
-                  ) : null}
-                  {enrich && typeof (enrich as any).no_match === 'number' && (enrich as any).no_match > 0 ? (
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={() => setShowNoMatchModal(true)}
-                      disabled={!!(enrich && enrich.running) || !!(localize && localize.running) || migrationRunning}
-                    >
-                      {t('review_no_match')} ({(enrich as any).no_match})
-                    </Button>
-                  ) : null}
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-xs text-slate-400">TMDB:</span>
-                    {tmdbConfigured === null ? (
-                      <span className="text-xs text-slate-500">{t('checking')}</span>
-                    ) : tmdbConfigured ? (
-                      <span className="text-xs text-green-400">{t('configured')}</span>
-                    ) : (
-                      <span className="text-xs text-yellow-400">{t('not_configured')}</span>
-                    )}
-                    <Button
-                      size="sm"
-                      onClick={handleTestTmdb}
-                      className="ml-2"
-                      disabled={tmdbBusy !== 'idle' || tmdbTestResult === 'testing'}
-                    >
-                      {tmdbTestResult === 'testing' ? t('testing') : t('test_tmdb')}
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={() => {
-                        setShowTmdbCredentials(v => !v);
-                        setTmdbCredMsg(null);
-                        setFinalizeMsg(null);
-                      }}
-                      icon={showTmdbCredentials ? <X size={14} /> : <Pencil size={14} />}
-                      className="ml-1"
-                    >
-                      {showTmdbCredentials ? t('close') : t('set_key')}
-                    </Button>
-                  </div>
-                </div>
-              </div>
-
-              {finalizeMsg ? (
-                <div className={`mb-2 text-xs break-words ${finalizeMsg.toLowerCase().includes('ok') ? 'text-green-400' : 'text-yellow-300'}`}>
-                  {finalizeMsg}
-                </div>
-              ) : null}
-
-              {tmdbTestResult ? (
-                <div
-                  className={`text-xs mb-2 break-words ${tmdbTestResult === 'ok'
-                      ? 'text-green-400'
-                      : tmdbTestResult === 'testing'
-                        ? 'text-slate-400'
-                        : 'text-red-300'
-                    }`}
-                >
-                  {t('tmdb_test')}: {tmdbTestResult === 'ok' ? t('ok') : tmdbTestResult === 'testing' ? t('testing') : tmdbTestResult}
-                </div>
-              ) : null}
-
-              {showTmdbCredentials ? (
-                  <div className="mb-4 bg-slate-900/40 border border-white/5 rounded-xl p-4">
-                  <div className="flex items-center justify-between mb-3">
-                    <div className="text-sm font-medium text-slate-200">{t('tmdb_credentials')}</div>
-                    <label className="flex items-center gap-2 text-xs text-slate-400">
-                      <input
-                        type="checkbox"
-                        checked={showTmdbSecrets}
-                        onChange={(e) => setShowTmdbSecrets(e.target.checked)}
-                        className="rounded border-slate-600 bg-slate-800 text-indigo-500 focus:ring-indigo-500"
-                      />
-                      {t('show')}
-                    </label>
-                  </div>
-
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div>
-                      <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">{t('tmdb_api_key')}</label>
-                      <input
-                        type={showTmdbSecrets ? 'text' : 'password'}
-                        value={tmdbApiKeyInput}
-                        onChange={(e) => setTmdbApiKeyInput(e.target.value)}
-                        className="w-full bg-slate-900/50 border border-white/10 rounded-lg px-4 py-2.5 text-sm text-white focus:ring-2 focus:ring-indigo-500 focus:border-transparent outline-none"
-                        placeholder={t('tmdb_api_key_placeholder')}
-                        autoComplete="off"
-                      />
+                    <div className="mt-2 text-[11px] text-slate-400">
+                      {(an as any).current_step ? String((an as any).current_step) : '—'} · {(an as any).current_title ? String((an as any).current_title) : '—'}
                     </div>
-                    <div>
-                      <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">{t('tmdb_access_token')}</label>
-                      <input
-                        type={showTmdbSecrets ? 'text' : 'password'}
-                        value={tmdbAccessTokenInput}
-                        onChange={(e) => setTmdbAccessTokenInput(e.target.value)}
-                        className="w-full bg-slate-900/50 border border-white/10 rounded-lg px-4 py-2.5 text-sm text-white focus:ring-2 focus:ring-indigo-500 focus:border-transparent outline-none"
-                        placeholder={t('tmdb_token_placeholder')}
-                        autoComplete="off"
-                      />
+                    <div className="mt-3 h-2 rounded-full bg-white/5 overflow-hidden border border-white/10">
+                      <div className="h-full bg-gradient-to-r from-amber-400 to-orange-500" style={{ width: `${anPct}%` }} />
                     </div>
-                  </div>
-
-                  <div className="mt-4 flex items-center justify-between gap-4 flex-wrap">
-                    <label className="flex items-center space-x-3 cursor-pointer group">
-                      <div className={`w-10 h-6 rounded-full p-1 transition-colors ${tmdbUseV4 ? 'bg-green-500' : 'bg-slate-700'}`}>
-                        <div className={`w-4 h-4 bg-white rounded-full shadow-sm transition-transform ${tmdbUseV4 ? 'translate-x-4' : ''}`} />
-                      </div>
-                      <input
-                        type="checkbox"
-                        className="hidden"
-                        checked={tmdbUseV4}
-                        onChange={(e) => setTmdbUseV4(e.target.checked)}
-                      />
-                      <span className="text-sm text-slate-300 group-hover:text-white transition-colors">{t('use_v4_token')}</span>
-                    </label>
-
-                    <div className="flex items-center gap-2">
-                      <Button
-                        size="sm"
-                        variant="secondary"
-                        onClick={handleValidateTmdbCredentials}
-                        disabled={tmdbBusy !== 'idle' || (!tmdbApiKeyInput.trim() && !tmdbAccessTokenInput.trim())}
-                        icon={tmdbBusy === 'validating' ? <Loader2 className="animate-spin" size={14} /> : <CheckCircle size={14} />}
-                      >
-                        {t('validate')}
+                    <div className="mt-2 text-[11px] text-slate-500 font-mono">
+                      {anProcessed}/{anTotal} · updated {(an as any).updated ?? 0} · failed {(an as any).failed ?? 0}
+                    </div>
+                    <div className="mt-3 flex gap-2">
+                      <Button size="sm" onClick={() => void handleStartAnimeNormalize()} disabled={lenguajeBusy !== 'idle' || anRunning}>
+                        Iniciar
                       </Button>
-                      <Button
-                        size="sm"
-                        onClick={handleSaveTmdbCredentials}
-                        disabled={tmdbBusy !== 'idle' || (!tmdbApiKeyInput.trim() && !tmdbAccessTokenInput.trim() && !tmdbUseV4)}
-                        icon={tmdbBusy === 'saving' ? <Loader2 className="animate-spin" size={14} /> : <Save size={14} />}
-                      >
-                        {t('save')}
+                      <Button size="sm" variant="ghost" onClick={() => void handleStopAnimeNormalize()} disabled={lenguajeBusy !== 'idle' || !anRunning}>
+                        Detener
                       </Button>
                     </div>
                   </div>
 
-                  <div className="mt-3 text-xs text-slate-500">
-                    {t('saved_in')} <span className="font-mono">data/app_config.json</span> {t('on_server')}
-                  </div>
-
-                  {tmdbCredMsg ? (
-                    <div className={`mt-2 text-xs break-words ${tmdbCredMsg.toLowerCase().includes('failed') || tmdbCredMsg.toLowerCase().includes('error') || tmdbCredMsg.toLowerCase().includes('fall') || tmdbCredMsg.toLowerCase().includes('no se pudo') ? 'text-red-300' : tmdbCredMsg.toLowerCase().includes('saved') || tmdbCredMsg.toLowerCase().includes('guard') || tmdbCredMsg.toLowerCase().includes('valid') || tmdbCredMsg.toLowerCase().includes('ok') ? 'text-green-400' : 'text-yellow-300'}`}>
-                      {tmdbCredMsg}
+                  <div className="bg-black/40 p-4 rounded-2xl border border-white/10">
+                    <div className="flex items-center justify-between">
+                      <div className="text-sm text-white font-semibold">Anime Translations (Jikan → ES)</div>
+                      <span className={`text-[10px] font-black uppercase tracking-widest px-2 py-1 rounded-full border ${locRunning ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-300' : 'bg-white/5 border-white/10 text-slate-400'}`}>
+                        {locRunning ? 'Running' : 'Idle'}
+                      </span>
                     </div>
-                  ) : null}
-                </div>
-              ) : null}
-
-              <div className="flex items-center justify-between mb-2">
-                <div className="flex items-center gap-3">
-                  <label className="text-xs text-slate-400">{t('active')}</label>
-                  <button onClick={() => setLivePaused(p => !p)} className={`px-2 py-1 text-xs rounded ${livePaused ? 'bg-slate-700 text-yellow-300' : 'bg-slate-800 text-slate-200'}`}>
-                    {livePaused ? t('resume') : t('pause')}
-                  </button>
-                </div>
-                <div className="text-xs text-slate-400">{t('recent_activity')}</div>
-              </div>
-
-              {activeJob && activeJob.running ? (
-                <div className="flex items-start space-x-3">
-                  <Loader2 className="animate-spin text-purple-400" size={16} />
-                  <div className="flex-1">
-                    <p className="text-sm text-indigo-300 font-medium">{t('fetching')}: {activeJob.current_title || t('unknown')}</p>
-                    <p className="text-xs text-slate-400 mt-1">{t('step')}: {formatEnrichStep(activeJob.current_step)}</p>
-                    {activeJob.last_updated ? (
-                      <p className="text-xs text-slate-500 mt-1">{t('updated')}: {new Date(activeJob.last_updated * 1000).toLocaleTimeString()}</p>
-                    ) : null}
-                    {activeJob.job === 'enrich' && typeof (activeJob as any).total === 'number' ? (
-                      <div className="mt-3">
-                        <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
-                          <span>{t('db_ingestion')}</span>
-                          <span>{((activeJob as any).total - (typeof (activeJob as any).pending_total === 'number' ? (activeJob as any).pending_total : (activeJob as any).pending))} / {(activeJob as any).total}</span>
-                        </div>
-                        <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
-                          <div
-                            style={{
-                              width: `${computeEnrichProgress(activeJob)}%`
-                            }}
-                            className="h-full bg-gradient-to-r from-green-400 to-indigo-500"
-                          />
-                        </div>
-                      </div>
-                    ) : null}
-
-                    {/* Recent activity log */}
-                    {activeJob.job === 'enrich' ? <div className="mt-3">
-                      <div className="text-xs text-slate-400 mb-2">{t('logs')}</div>
-                      <div className="max-h-48 overflow-auto bg-slate-900/40 p-2 rounded-md border border-white/5 text-xs">
-                        {enrichHistory.length === 0 ? (
-                          <div className="text-slate-500">{t('no_recent_events')}</div>
-                        ) : (
-                          enrichHistory.map((ev, i) => (
-                            <div key={i} className="flex items-center justify-between py-1 border-b border-white/3 last:border-b-0">
-                              <div>
-                                <div className="text-slate-200">{ev.type === 'processing' ? `${t('processing')}: ${ev.title || ('#' + ev.id)}` : ev.type === 'ingested' ? `${t('ingested')} ${ev.count} ${t('items')}` : String(ev.type)}</div>
-                                <div className="text-slate-400 text-[11px]">{new Date(ev.ts).toLocaleTimeString()}</div>
-                              </div>
-                              <div className="text-slate-400 text-[11px] ml-4">{ev.id ? `#${ev.id}` : ''}</div>
-                            </div>
-                          ))
-                        )}
-                      </div>
-                    </div> : null}
+                    <div className="mt-2 text-[11px] text-slate-400">
+                      {(loc as any).current_step ? String((loc as any).current_step) : '—'} · {(loc as any).current_title ? String((loc as any).current_title) : '—'}
+                    </div>
+                    <div className="mt-3 h-2 rounded-full bg-white/5 overflow-hidden border border-white/10">
+                      <div className="h-full bg-gradient-to-r from-cyan-400 to-blue-500" style={{ width: `${locPct}%` }} />
+                    </div>
+                    <div className="mt-2 text-[11px] text-slate-500 font-mono">
+                      {locProcessed}/{locTotal} · failed {(loc as any).failed ?? 0}
+                    </div>
+                    <div className="mt-3 flex gap-2">
+                      <Button size="sm" onClick={() => void handleRunAnimeTranslations()} disabled={lenguajeBusy !== 'idle'}>
+                        Ejecutar traducciones
+                      </Button>
+                    </div>
                   </div>
                 </div>
-              ) : (
-                <div>
-                  <div className="text-sm text-slate-400 mb-2">{t('no_processes')}</div>
-                  {enrich && typeof enrich.total === 'number' ? (
-                    <div>
-                      <div className="flex items-center justify-between text-xs text-slate-400 mb-1">
-                        <span>{t('pending')}</span>
-                        <span>{enrich.pending} {t('pending_of')} {enrich.total} {t('total')}</span>
-                      </div>
-                      {typeof (enrich as any).pending_total === 'number' ? (
-                        <div className="flex items-center justify-between text-[11px] text-slate-500 mb-1">
-                          <span>{t('unenriched')}</span>
-                          <span>{(enrich as any).pending_total}</span>
-                        </div>
-                      ) : null}
-                      {typeof (enrich as any).no_match === 'number' ? (
-                        <div className="flex items-center justify-between text-[11px] text-slate-500 mb-1">
-                          <span>{t('no_match')}</span>
-                          <span>{(enrich as any).no_match}</span>
-                        </div>
-                      ) : null}
-                      {typeof (enrich as any).error === 'number' ? (
-                        <div className="flex items-center justify-between text-[11px] text-slate-500 mb-1">
-                          <span>{t('error')}</span>
-                          <span>{(enrich as any).error}</span>
-                        </div>
-                      ) : null}
-                      <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
-                        <div
-                          style={{
-                            width: `${computeEnrichProgress(enrich)}%`
-                          }}
-                          className="h-full bg-gradient-to-r from-green-400 to-indigo-500"
-                        />
-                      </div>
-                    </div>
-                  ) : null}
-                </div>
-              )}
-            </div>
-
-            <Button
-              onClick={onStartScan}
-              disabled={scanStatus.scanning || libraryPaths.length === 0}
-              className="w-full"
-              size="lg"
-              icon={scanStatus.scanning ? <Loader2 className="animate-spin" size={18} /> : <RefreshCw size={18} />}
-            >
-              {scanStatus.scanning ? t('stop_scan') : t('start_full_scan')}
-            </Button>
           </div>
-
-          {/* Metadata Configuration */}
-          <div className="glass-panel p-6 rounded-2xl border border-white/5">
-            <h2 className="text-xl font-semibold flex items-center mb-6 text-indigo-100">
-              <Database className="mr-3 text-indigo-400" /> {t('metadata')}
-            </h2>
-
-            <div className="space-y-6">
-              {/* Movies Source */}
-              <div>
-                <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">{t('movies_tv_agent')}</label>
-                <div className="grid grid-cols-3 gap-2">
-                  {['tmdb', 'tvdb', 'omdb'].map((provider) => (
-                    <button
-                      key={provider}
-                      onClick={() => {
-                        if (provider !== 'tmdb') return;
-                        onUpdateConfig({ ...metadataConfig, moviesProvider: provider as any });
-                      }}
-                      disabled={provider !== 'tmdb'}
-                      className={`
-                        py-2 px-3 rounded-lg text-sm font-medium transition-all
-                        ${metadataConfig.moviesProvider === provider
-                          ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-500/20'
-                          : provider !== 'tmdb' ? 'bg-slate-900/40 text-slate-600 cursor-not-allowed opacity-60' : 'bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-slate-200'}
-                      `}
-                      title={provider !== 'tmdb' ? t('not_available_tmdb_only') : undefined}
-                    >
-                      {provider === 'tmdb' ? 'TMDB' : provider.toUpperCase()}
-                    </button>
-                  ))}
-                </div>
+          {/* Telemetry */}
+          <div className="rounded-3xl border border-white/10 bg-gradient-to-br from-[#0b1020] via-[#0f172a] to-[#0b1020] p-6 shadow-[0_20px_60px_-45px_rgba(15,23,42,0.9)] lg:col-span-2">
+            <h2 className="text-xl font-semibold flex items-center text-white mb-4"><ScanLine className="mr-3 text-amber-400" /> {t('control_telemetry')}</h2>
+            <div className="mb-4 grid grid-cols-1 md:grid-cols-4 gap-3">
+              <div className="rounded-2xl border border-white/10 bg-black/30 px-4 py-3">
+                <div className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-500">Live API</div>
+                <div className="mt-1 text-sm font-semibold text-white">{currentApiProvider || 'Idle'}</div>
               </div>
-
-              {/* Anime Source */}
-              <div>
-                <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">{t('anime_agent')}</label>
-                <div className="grid grid-cols-3 gap-2">
-                  {['jikan', 'anilist', 'kitsu'].map((provider) => (
-                    <button
-                      key={provider}
-                      onClick={() => {
-                        if (provider !== 'jikan') return;
-                        onUpdateConfig({ ...metadataConfig, animeProvider: provider as any });
-                      }}
-                      disabled={provider !== 'jikan'}
-                      className={`
-                        py-2 px-3 rounded-lg text-sm font-medium transition-all
-                        ${metadataConfig.animeProvider === provider
-                          ? 'bg-purple-600 text-white shadow-lg shadow-purple-500/20'
-                          : provider !== 'jikan' ? 'bg-slate-900/40 text-slate-600 cursor-not-allowed opacity-60' : 'bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-slate-200'}
-                      `}
-                      title={provider !== 'jikan' ? t('not_available_jikan_only') : undefined}
-                    >
-                      {provider.charAt(0).toUpperCase() + provider.slice(1)}
-                    </button>
-                  ))}
-                </div>
+              <div className="rounded-2xl border border-white/10 bg-black/30 px-4 py-3">
+                <div className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-500">Jikan</div>
+                <div className={`mt-1 text-sm font-semibold ${jikanHealth?.ok ? 'text-emerald-300' : 'text-red-300'}`}>{jikanHealth == null ? 'Checking' : jikanHealth.ok ? 'Online' : 'Unavailable'}</div>
               </div>
-
-              <div className="pt-4 border-t border-white/5">
-                <label className="flex items-center space-x-3 cursor-pointer group">
-                  <div className={`w-10 h-6 rounded-full p-1 transition-colors ${metadataConfig.downloadImages ? 'bg-green-500' : 'bg-slate-700'}`}>
-                    <div className={`w-4 h-4 bg-white rounded-full shadow-sm transition-transform ${metadataConfig.downloadImages ? 'translate-x-4' : ''}`} />
+              <div className="rounded-2xl border border-white/10 bg-black/30 px-4 py-3">
+                <div className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-500">Kitsu</div>
+                <div className={`mt-1 text-sm font-semibold ${kitsuHealth?.ok ? 'text-emerald-300' : 'text-red-300'}`}>{kitsuHealth == null ? 'Checking' : kitsuHealth.ok ? 'Online' : 'Unavailable'}</div>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-black/30 px-4 py-3">
+                <div className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-500">API Events</div>
+                <div className="mt-1 text-sm font-semibold text-white">{recentApiActivity.length}</div>
+              </div>
+            </div>
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <div className="space-y-2">
+                {telemetryTaskList.map(task => (
+                  <div key={task.task_id} className="bg-black/40 p-3 rounded-xl border border-white/10">
+                    <div className="flex justify-between mb-2"><div className="text-sm text-slate-200 font-medium">{task.title || task.task_id}</div><div className="text-[11px] text-slate-500">{task.current_phase || task.status}</div></div>
+                    <div className="flex flex-wrap gap-2">{TELEMETRY_PHASES.map(p => <span key={p} className={`px-2 py-0.5 rounded-full text-[10px] ${task.phases?.[p]?.status === 'done' ? 'bg-green-500/20 text-green-300' : task.phases?.[p]?.status === 'running' ? 'bg-blue-500/20 text-blue-300' : 'bg-slate-800 text-slate-400'}`}>{p.replace('_', ' ')}</span>)}</div>
                   </div>
-                  <input
-                    type="checkbox"
-                    className="hidden"
-                    checked={metadataConfig.downloadImages}
-                    onChange={(e) => onUpdateConfig({ ...metadataConfig, downloadImages: e.target.checked })}
-                  />
-                  <span className="text-sm text-slate-300 group-hover:text-white transition-colors">{t('auto_download_posters')}</span>
-                </label>
+                ))}
+                {recentApiActivity.map((ev, idx) => (
+                  <div key={`api-${idx}`} className="bg-black/30 p-3 rounded-xl border border-cyan-500/10">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="text-sm font-semibold text-cyan-100">{String(ev.provider || ev.service || 'unknown').toUpperCase()}</div>
+                      <div className="text-[11px] text-slate-500">{ev.status_code ? `HTTP ${ev.status_code}` : ev.type}</div>
+                    </div>
+                    <div className="mt-1 text-[11px] text-slate-400 font-mono truncate">{String(ev.endpoint || ev.message || 'activity')}</div>
+                  </div>
+                ))}
+              </div>
+              <div className="min-h-[420px] max-h-[56vh] overflow-auto bg-black/40 p-3 rounded-xl border border-white/10 text-xs">
+                {filteredLogs.map((ev, idx) => (
+                  <div key={idx} className="py-1 border-b border-white/5 last:border-b-0">
+                    <span className="text-slate-500 mr-2">{new Date((ev.ts || 0) * 1000).toLocaleTimeString()}</span>
+                    <span className={`mr-2 ${String(ev.level).toUpperCase().includes('ERROR') ? 'text-red-300' : 'text-slate-300'}`}>[{String(ev.level).toUpperCase()}]</span>
+                    <span className="text-slate-200">{ev.message}</span>
+                  </div>
+                ))}
               </div>
             </div>
           </div>
-
         </div>
       </div>
 
+      <HelpModal open={showHelpModal} onClose={() => setShowHelpModal(false)} />
       <NoMatchModal
         open={showNoMatchModal}
         onClose={() => setShowNoMatchModal(false)}
@@ -1319,38 +1033,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           if (onRefresh) onRefresh();
         }}
       />
-
-      <HelpModal
-        open={showHelpModal}
-        onClose={() => setShowHelpModal(false)}
-      />
-
-      {/* Logs modal */}
-      {showSystemLogs ? (
-        <div className="fixed inset-0 z-[90] bg-black/70 backdrop-blur-sm p-4 flex items-center justify-center" onClick={() => setShowSystemLogs(false)}>
-          <div className="w-full max-w-4xl bg-slate-950/90 border border-white/10 rounded-2xl shadow-2xl overflow-hidden" onClick={(e) => e.stopPropagation()}>
-            <div className="px-5 py-4 border-b border-white/10 flex items-center justify-between">
-              <div className="min-w-0">
-                <div className="text-white font-semibold">{t('system_logs')}</div>
-                <div className="mt-1 text-xs text-slate-500 font-mono truncate">{logsTail?.path || ''}</div>
-              </div>
-              <div className="flex items-center gap-2">
-                <Button size="sm" variant="ghost" onClick={() => void refreshLogs()} icon={<RefreshCw size={14} />}>{t('reload')}</Button>
-                <button onClick={() => setShowSystemLogs(false)} className="p-2 rounded-lg hover:bg-white/10 text-slate-300 hover:text-white"><X size={18} /></button>
-              </div>
-            </div>
-            <div className="max-h-[65vh] overflow-auto p-4">
-              {logsTail?.error ? (
-                <div className="text-sm text-red-300">{t('error_label')}: {logsTail.error}</div>
-              ) : (
-                <pre className="text-[11px] leading-relaxed font-mono text-slate-200 whitespace-pre-wrap">
-                  {(logsTail?.lines || []).join('\n') || t('no_data')}
-                </pre>
-              )}
-            </div>
-          </div>
-        </div>
-      ) : null}
     </div>
   );
 };

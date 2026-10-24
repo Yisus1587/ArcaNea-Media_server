@@ -5,9 +5,15 @@ import { getUiLang } from '../i18n/i18n';
 const API_BASE = '/api';
 
 let adminMode = false;
+let telemetryToken = '';
 
 export function setAdminMode(flag: boolean) {
   adminMode = !!flag;
+}
+
+function setTelemetryToken(token: string | null | undefined) {
+  const t = String(token || '').trim();
+  if (t) telemetryToken = t;
 }
 
 function getAdminToken(): string {
@@ -46,26 +52,26 @@ function profileHeaders(profileId?: string): HeadersInit | undefined {
   return { 'X-Arcanea-Profile-Id': pid };
 }
 
-function _getDirectApiBases(): string[] {
-  // Prefer same-host port 9800; avoid 127.0.0.1 fallback on mobile.
+function getBrowserOrigins(): { origin: string; wsOrigin: string } | null {
   try {
-    if (typeof window === 'undefined') return ['http://127.0.0.1:9800/api'];
-    const host = window.location.hostname;
-    const proto = window.location.protocol; // http: or https:
-    const isLocal = host === 'localhost' || host === '127.0.0.1';
-    const bases: string[] = [];
-
-    // Same host, backend port 9800 (use same scheme if backend is also TLS-enabled)
-    if (host) bases.push(`${proto}//${host}:9800/api`);
-
-    // Local-only fallback
-    if (isLocal) bases.push(`${proto}//127.0.0.1:9800/api`);
-
-    // de-dupe
-    return Array.from(new Set(bases));
-  } catch (e) {
-    return ['http://127.0.0.1:9800/api'];
+    if (typeof window === 'undefined') return null;
+    const protocol = window.location.protocol || 'http:';
+    const host = window.location.host;
+    if (!host) return null;
+    const origin = `${protocol}//${host}`;
+    const wsProtocol = protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsOrigin = `${wsProtocol}//${host}`;
+    return { origin, wsOrigin };
+  } catch {
+    return null;
   }
+}
+
+function _getDirectApiBases(): string[] {
+  // Always mirror the browser origin (protocol/host/port).
+  const origins = getBrowserOrigins();
+  if (!origins) return [];
+  return [`${origins.origin}${API_BASE}`];
 }
 
 export function getStatusWsUrls(): string[] {
@@ -73,15 +79,33 @@ export function getStatusWsUrls(): string[] {
     if (typeof window === 'undefined') return [];
     const token = getAdminToken();
     if (!token) return [];
-    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const sameHost = `${proto}//${window.location.host}/api/ws/status?admin_token=${encodeURIComponent(token)}`;
-    const fallbacks = _getDirectApiBases().map((b) =>
-      b
-        .replace(/^http:/i, 'ws:')
-        .replace(/^https:/i, 'wss:')
-        .replace(/\/api\/?$/i, `/api/ws/status?admin_token=${encodeURIComponent(token)}`),
-    );
-    return Array.from(new Set([sameHost, ...fallbacks]));
+    const origins = getBrowserOrigins();
+    if (!origins) return [];
+    const sameHost = `${origins.wsOrigin}${API_BASE}/ws/status?admin_token=${encodeURIComponent(token)}`;
+    return [sameHost];
+  } catch {
+    return [];
+  }
+}
+
+export function getTelemetrySseUrls(): string[] {
+  try {
+    if (typeof window === 'undefined') return [];
+    const origins = getBrowserOrigins();
+    if (!origins) return [];
+    const token = getAdminToken();
+    const urls: string[] = [];
+    if (telemetryToken) {
+      urls.push(`${origins.origin}${API_BASE}/telemetry/stream?telemetry_token=${encodeURIComponent(telemetryToken)}`);
+    }
+    if (token) {
+      urls.push(`${origins.origin}${API_BASE}/telemetry/stream?admin_token=${encodeURIComponent(token)}`);
+    }
+    // Only include unauthenticated fallback when no token is available, to avoid 403 retry loops.
+    if (!urls.length) {
+      urls.push(`${origins.origin}${API_BASE}/telemetry/stream`);
+    }
+    return urls;
   } catch {
     return [];
   }
@@ -119,6 +143,34 @@ export function normalizeRoots(input: unknown): string[] {
   return out;
 }
 
+export function normalizeRootTypes(input: unknown): Record<string, string> {
+  const arr = Array.isArray(input) ? input : [];
+  const out: Record<string, string> = {};
+  for (const raw of arr) {
+    if (!raw || typeof raw !== 'object') continue;
+    const path = typeof (raw as any).path === 'string' ? String((raw as any).path).trim() : '';
+    if (!path) continue;
+    const t = typeof (raw as any).type === 'string' ? String((raw as any).type).trim().toLowerCase() : '';
+    if (!t || t === 'unknown') continue;
+    out[path] = t;
+  }
+  return out;
+}
+
+export function buildRootTypesPayload(rootTypes: Record<string, string> | null | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(rootTypes || {})) {
+    const path = String(k || '').trim();
+    if (!path) continue;
+    const t = String(v || '').trim().toLowerCase();
+    if (!t || t === 'auto' || t === 'unknown') continue;
+    // normalize aliases
+    if (t === 'tv' || t === 'show' || t === 'shows') out[path] = 'series';
+    else out[path] = t;
+  }
+  return out;
+}
+
 function mapMediaType(t: string | undefined): 'movie' | 'series' | 'anime' {
   const s = (t || '').toLowerCase();
   if (s.includes('anime')) return 'anime';
@@ -126,11 +178,51 @@ function mapMediaType(t: string | undefined): 'movie' | 'series' | 'anime' {
   return 'movie';
 }
 
+function resolveAiringState(
+  provider: string,
+  mediaType: 'movie' | 'series' | 'anime',
+  metadata: any,
+): { isAiring: boolean; airingStatus?: string } {
+  if (mediaType === 'movie') return { isAiring: false };
+
+  const raw =
+    (typeof metadata?.status === 'string' && metadata.status.trim())
+      ? metadata.status.trim()
+      : undefined;
+  const status = (raw || '').toLowerCase();
+  if (!status) return { isAiring: false };
+
+  // Jikan: "Currently Airing", "Finished Airing"
+  if (provider === 'jikan') {
+    return { isAiring: status === 'currently airing' || status === 'airing', airingStatus: raw };
+  }
+  // Kitsu: "current", "finished", "tba", ...
+  if (provider === 'kitsu') {
+    return { isAiring: status === 'current' || status === 'ongoing' || status === 'airing', airingStatus: raw };
+  }
+  // TMDB TV: "Returning Series", "In Production", ...
+  if (provider === 'tmdb') {
+    return { isAiring: status === 'returning series' || status === 'in production' || status === 'continuing', airingStatus: raw };
+  }
+
+  // Generic fallback for unknown providers.
+  const generic = new Set([
+    'currently airing',
+    'airing',
+    'current',
+    'ongoing',
+    'returning series',
+    'in production',
+    'continuing',
+  ]);
+  return { isAiring: generic.has(status), airingStatus: raw };
+}
+
 function mapBackendItem(it: any): MediaItem {
   const metaList = Array.isArray(it.metadata) ? it.metadata : [];
   let metaEntry = it.primary_metadata || null;
   if (!metaEntry && metaList.length) {
-    metaEntry = metaList.find((m: any) => m && m.provider) || metaList[metaList.length - 1];
+    metaEntry = metaList.find((m: any) => m && m.provider) || metaList[0];
   }
   let metaDataObj: any = {};
   try {
@@ -150,18 +242,19 @@ function mapBackendItem(it: any): MediaItem {
   const primaryPath = files.length ? files[0].path : (it.canonical_path || '');
 
   const uiLang = getUiLang();
-  const i18nObj = metaDataObj?.raw?.i18n || metaDataObj?.i18n || null;
+  const provider = String(metaEntry?.provider || metaDataObj?.provider || it.provider || '').toLowerCase();
+  const i18nObj = provider === 'tmdb' ? (metaDataObj?.raw?.i18n || metaDataObj?.i18n || null) : null;
   const localized = i18nObj && typeof i18nObj === 'object' ? (i18nObj[uiLang] || i18nObj.en || i18nObj.es || null) : null;
 
   const rating = _toNumber(it.rating ?? metaDataObj?.score ?? metaDataObj?.rating ?? metaDataObj?.vote_average ?? metaDataObj?.rating?.value);
+  const contentRating = (typeof it.content_rating === 'string' && it.content_rating.trim())
+    ? it.content_rating.trim()
+    : (typeof metaDataObj?.content_rating === 'string' ? metaDataObj.content_rating.trim() : undefined);
   const overview =
     it?.synopsis_localized ??
     localized?.overview ??
     localized?.synopsis ??
-    metaDataObj?.overview ??
-    metaDataObj?.synopsis ??
-    metaDataObj?.description ??
-    undefined;
+    (provider === 'tmdb' ? (metaDataObj?.overview ?? metaDataObj?.synopsis ?? metaDataObj?.description) : undefined);
   const release = it.release_year ?? metaDataObj?.year ?? (metaDataObj?.release_date ? String(metaDataObj.release_date).slice(0, 4) : undefined);
   const year = release ? _toNumber(release) : undefined;
 
@@ -178,42 +271,75 @@ function mapBackendItem(it: any): MediaItem {
       ? it.title_localized.trim()
       : (typeof it?.title_en === 'string' && it.title_en.trim())
         ? it.title_en.trim()
-        : (localized?.title || it.title || it.base_title || '');
+      : (localized?.title || it.title || it.base_title || '');
+  const mediaType = mapMediaType(it.media_type);
+  const backendAiringStatus =
+    (typeof it.airing_status === 'string' && it.airing_status.trim())
+      ? it.airing_status.trim()
+      : undefined;
+  const backendAiring = (typeof it.is_airing === 'boolean') ? it.is_airing : undefined;
+  const airing =
+    backendAiring !== undefined
+      ? { isAiring: backendAiring, airingStatus: backendAiringStatus }
+      : resolveAiringState(provider, mediaType, metaDataObj);
 
   const manualBackdrop =
     (typeof it.backdrop_path === 'string' && it.backdrop_path.trim())
       ? it.backdrop_path
       : undefined;
+  const remoteBackdrop =
+    (typeof (it as any).backdrop_url === 'string' && String((it as any).backdrop_url).trim())
+      ? String((it as any).backdrop_url).trim()
+      : undefined;
+  const _isLocalAsset = (u?: string) => !!(u && u.trim().startsWith('/media-assets/'));
+  const resolvedBackdrop =
+    (_isLocalAsset(manualBackdrop) ? manualBackdrop : undefined) ||
+    (_isLocalAsset(remoteBackdrop) ? remoteBackdrop : undefined) ||
+    manualBackdrop ||
+    remoteBackdrop ||
+    metaDataObj?.backdrop_path ||
+    undefined;
 
   const item: MediaItem = {
     id: String(it.id ?? ''),
     title: resolvedTitle,
     path: primaryPath,
-    type: mapMediaType(it.media_type),
+    type: mediaType,
     year: year as number | undefined,
     duration: _toNumber(metaDataObj?.duration) as number | undefined,
     // Poster URL used by the UI
     posterPath: posterUrl,
     thumbnailUrl: posterUrl,
-    backdropUrl: manualBackdrop || metaDataObj?.backdrop_path || undefined,
+    backdropUrl: resolvedBackdrop,
     overview,
     rating: rating as number | undefined,
+    contentRating: contentRating || undefined,
     genre: genres,
     addedAt: it.created_at || new Date().toISOString(),
     // quick-access enriched fields
     malId: it.mal_id ?? metaDataObj?.mal_id ?? undefined,
+    tmdbId: it.tmdb_id ?? metaDataObj?.tmdb_id ?? metaDataObj?.id ?? undefined,
     isAnimated: (it.is_animated ?? metaDataObj?.is_animated) ? true : false,
     origin: it.origin ?? metaDataObj?.origin ?? undefined,
     releaseYear: it.release_year ?? metaDataObj?.release_year ?? year as number | undefined,
     runtime: _toNumber(it.runtime ?? metaDataObj?.runtime) as number | undefined,
     cast,
+    is_identified: (it as any).is_identified ?? undefined,
+    seriesId: it.series_id ?? (metaDataObj?.series_id ?? undefined),
+    seasonNumber: _toNumber(it.season_number) as number | undefined,
+    isAiring: airing.isAiring,
+    airingStatus: airing.airingStatus,
     };
 
   // Attach raw metadata and files so UI can render details and episode lists
   try {
-    // Preserve normalized metadata and provider raw payload
-    (item as any).rawMetadata = metaDataObj || {};
-    (item as any).files = files.map((f: any) => ({ filename: f.filename || f.filename, path: f.path, size: f.size, mtime: f.mtime, index: f.index ?? f.file_index }));
+    // Preserve normalized metadata and provider raw payload when available
+    if (metaEntry) {
+      (item as any).rawMetadata = metaDataObj || {};
+    }
+    if (files.length) {
+      (item as any).files = files.map((f: any) => ({ filename: f.filename || f.filename, path: f.path, size: f.size, mtime: f.mtime, index: f.index ?? f.file_index }));
+    }
   } catch (e) {
     // ignore
   }
@@ -256,12 +382,17 @@ async function fetchWithFallback(input: string, init?: RequestInit) {
 }
 
 export const MediaService = {
-  async getAll(page: number = 1, limit: number = 50, query?: string, types?: string[]): Promise<{ items: MediaItem[]; total: number }> {
+  // Helpers for legacy callers (SettingsView) that assume these are methods.
+  getTelemetrySseUrls,
+  getStatusWsUrls,
+
+  async getAll(page: number = 1, limit: number = 50, query?: string, types?: string[], isKidsSafe?: boolean): Promise<{ items: MediaItem[]; total: number }> {
     const skip = Math.max(0, (page - 1) * limit);
     try {
       const queryParam = query ? `&search=${encodeURIComponent(query)}` : '';
       const typesParam = (types && types.length) ? `&types=${encodeURIComponent(types.join(','))}` : '';
-      const response = await fetchWithFallback(`${API_BASE}/media?skip=${skip}&limit=${limit}${queryParam}${typesParam}`);
+      const kidsParam = isKidsSafe ? `&is_kids_safe=true` : '';
+      const response = await fetchWithFallback(`${API_BASE}/media?skip=${skip}&limit=${limit}&lite=true${queryParam}${typesParam}${kidsParam}`);
       if (!response.ok) throw new Error('Network response was not ok');
       const data = await response.json();
       const items = (data.items || []).map(mapBackendItem);
@@ -281,6 +412,18 @@ export const MediaService = {
       const total = items.length;
       const paged = items.slice(skip, skip + limit);
       return { items: paged as MediaItem[], total };
+    }
+  },
+
+  async getLibraryOverview(groupBy: string = 'library_type', sample: number = 6): Promise<any> {
+    try {
+      const response = await fetchWithFallback(`${API_BASE}/library/overview?group_by=${encodeURIComponent(groupBy)}&sample=${encodeURIComponent(String(sample))}`);
+      if (!response.ok) throw new Error('Failed to fetch library overview');
+      const data = await response.json();
+      return data;
+    } catch (error) {
+      console.warn('Failed to fetch library overview', error);
+      return { groups: [] };
     }
   },
 
@@ -384,18 +527,36 @@ export const MediaService = {
       const data = await response.json();
       // Ensure enrichment is present as returned by backend
       const out: any = {
-        scanning: !!data.scanning || data.status === 'scanning' || false,
+        scanning: !!data.scanning || data.status === 'scanning' || data.status === 'queued' || false,
         progress: typeof data.progress === 'number' ? data.progress : (data.total && data.processed ? Math.round((data.processed / data.total) * 100) : 0),
         currentFile: data.current || data.currentFile || null,
         total: data.total,
         processed: data.processed,
+        queued: data.queued,
         status: data.status,
         enrichment: data.enrichment || null,
+        phase: data.phase,
+        last_item: data.last_item,
+        root_counts: data.root_counts || null,
+        watch: data.watch || null,
+        titles_total: data.titles_total ?? data.titlesTotal,
       };
       return out as ScanStatus;
     } catch (error) {
       return { scanning: false, progress: 100 } as ScanStatus;
     }
+  },
+
+  async getScanItems(limit: number = 200, offset: number = 0, root?: string | null): Promise<{ total: number; items: Array<{ id: number | string; title?: string | null; path?: string | null; media_root?: string | null; media_type?: string | null }> }> {
+    const qs: string[] = [];
+    if (typeof limit === 'number') qs.push(`limit=${encodeURIComponent(String(limit))}`);
+    if (typeof offset === 'number') qs.push(`offset=${encodeURIComponent(String(offset))}`);
+    if (root) qs.push(`root=${encodeURIComponent(root)}`);
+    const url = qs.length ? `${API_BASE}/scan/items?${qs.join('&')}` : `${API_BASE}/scan/items`;
+    const res = await fetchWithFallback(url, { headers: adminHeadersAny() });
+    if (!res.ok) throw new Error('Failed to fetch scan items');
+    const data = await res.json();
+    return { total: Number(data?.total || 0), items: Array.isArray(data?.items) ? data.items : [] };
   },
 
   async getEnrichStatus(): Promise<any> {
@@ -409,15 +570,74 @@ export const MediaService = {
     }
   },
 
-  async getLocalizeStatus(): Promise<any> {
-    try {
-      const response = await fetchWithFallback(`${API_BASE}/localize/status`);
-      if (!response.ok) throw new Error('Failed to fetch localize status');
-      const data = await response.json();
-      return data;
-    } catch (e) {
-      return { running: false };
-    }
+  async searchEntities(query: string, limit: number = 50, offset: number = 0): Promise<any> {
+    const q = String(query || '').trim();
+    const response = await fetchWithFallback(`${API_BASE}/admin/entities/search?q=${encodeURIComponent(q)}&limit=${limit}&offset=${offset}`, {
+      headers: adminHeadersAny(),
+    });
+    if (!response.ok) throw new Error('Failed to search entities');
+    return await response.json();
+  },
+
+  async deepPurgeEntity(itemId: number): Promise<any> {
+    const response = await fetchWithFallback(`${API_BASE}/admin/entities/${itemId}/deep-purge`, {
+      method: 'POST',
+      headers: adminHeadersAny(),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data?.detail || 'Failed to purge');
+    return data;
+  },
+
+  async rematchEntity(itemId: number, payload: any): Promise<any> {
+    const response = await fetchWithFallback(`${API_BASE}/admin/entities/${itemId}/rematch`, {
+      method: 'POST',
+      headers: { ...(adminHeadersAny() || {}), 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload || {}),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data?.detail || 'Failed to rematch');
+    return data;
+  },
+
+  async getConflicts(kind: string = 'all'): Promise<any> {
+    const response = await fetchWithFallback(`${API_BASE}/admin/conflicts?kind=${encodeURIComponent(kind)}`, {
+      headers: adminHeadersAny(),
+    });
+    if (!response.ok) throw new Error('Failed to fetch conflicts');
+    return await response.json();
+  },
+
+  async mergeConflicts(keepId: number, dropId: number): Promise<any> {
+    const response = await fetchWithFallback(`${API_BASE}/admin/conflicts/merge`, {
+      method: 'POST',
+      headers: { ...(adminHeadersAny() || {}), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keep_id: keepId, drop_id: dropId }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data?.detail || 'Failed to merge');
+    return data;
+  },
+
+  async fullSystemReset(confirm: string): Promise<any> {
+    const response = await fetchWithFallback(`${API_BASE}/admin/system/reset`, {
+      method: 'POST',
+      headers: { ...(adminHeadersAny() || {}), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data?.detail || 'Failed to reset');
+    return data;
+  },
+
+  async clearScanQueue(): Promise<any> {
+    const response = await fetchWithFallback(`${API_BASE}/admin/queue/clear`, {
+      method: 'POST',
+      headers: adminHeadersAny(),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data?.detail || 'Failed to clear queue');
+    return data;
   },
 
   async manualSearchTmdb(query: string, language: string): Promise<any> {
@@ -430,6 +650,24 @@ export const MediaService = {
     return response.json();
   },
 
+  async manualSearchJikan(query: string): Promise<any> {
+    const q = encodeURIComponent(query || '');
+    const response = await fetchWithFallback(`${API_BASE}/manual-mapping/jikan/search?query=${q}`, {
+      headers: adminHeaders(),
+    });
+    if (!response.ok) throw new Error('Failed to search Jikan');
+    return response.json();
+  },
+
+  async manualSearchKitsu(query: string): Promise<any> {
+    const q = encodeURIComponent(query || '');
+    const response = await fetchWithFallback(`${API_BASE}/manual-mapping/kitsu/search?query=${q}`, {
+      headers: adminHeaders(),
+    });
+    if (!response.ok) throw new Error('Failed to search Kitsu');
+    return response.json();
+  },
+
   async manualTmdbDetails(tmdbId: string, mediaType: string, language: string): Promise<any> {
     const id = encodeURIComponent(tmdbId);
     const mt = encodeURIComponent(mediaType || 'tv');
@@ -438,6 +676,24 @@ export const MediaService = {
       headers: adminHeaders(),
     });
     if (!response.ok) throw new Error('Failed to fetch TMDB details');
+    return response.json();
+  },
+
+  async manualJikanDetails(malId: string): Promise<any> {
+    const id = encodeURIComponent(malId);
+    const response = await fetchWithFallback(`${API_BASE}/manual-mapping/jikan/${id}/details`, {
+      headers: adminHeaders(),
+    });
+    if (!response.ok) throw new Error('Failed to fetch Jikan details');
+    return response.json();
+  },
+
+  async manualKitsuDetails(kitsuId: string): Promise<any> {
+    const id = encodeURIComponent(kitsuId);
+    const response = await fetchWithFallback(`${API_BASE}/manual-mapping/kitsu/${id}/details`, {
+      headers: adminHeaders(),
+    });
+    if (!response.ok) throw new Error('Failed to fetch Kitsu details');
     return response.json();
   },
 
@@ -461,6 +717,14 @@ export const MediaService = {
     return response.json();
   },
 
+  async manualLocalSeasons(itemId: number): Promise<any> {
+    const response = await fetchWithFallback(`${API_BASE}/manual-mapping/${encodeURIComponent(String(itemId))}/local-seasons`, {
+      headers: adminHeaders(),
+    });
+    if (!response.ok) throw new Error('Failed to fetch local seasons');
+    return response.json();
+  },
+
   async manualApplyMapping(itemId: number, payload: any): Promise<any> {
     const response = await fetchWithFallback(`${API_BASE}/manual-mapping/${itemId}/apply`, {
       method: 'POST',
@@ -480,6 +744,15 @@ export const MediaService = {
     return response.json();
   },
 
+  async getInProgress(limit: number = 12, profileId?: string): Promise<any> {
+    const pid = profileId ? `&profile_id=${encodeURIComponent(profileId)}` : '';
+    const response = await fetchWithFallback(`${API_BASE}/media/in-progress?limit=${encodeURIComponent(String(limit))}${pid}`, {
+      headers: profileHeaders(profileId),
+    });
+    if (!response.ok) throw new Error('Failed to fetch in-progress items');
+    return response.json();
+  },
+
   async recordPlay(itemId: number, profileId?: string): Promise<any> {
     const pid = profileId ? `?profile_id=${encodeURIComponent(profileId)}` : '';
     const response = await fetchWithFallback(`${API_BASE}/media/${itemId}/play${pid}`, {
@@ -487,6 +760,26 @@ export const MediaService = {
       headers: profileHeaders(profileId),
     });
     if (!response.ok) throw new Error('Failed to record play');
+    return response.json();
+  },
+
+  async getPlaybackProgress(itemId: number, profileId?: string): Promise<any> {
+    const pid = profileId ? `?profile_id=${encodeURIComponent(profileId)}` : '';
+    const response = await fetchWithFallback(`${API_BASE}/media/${itemId}/progress${pid}`, {
+      headers: profileHeaders(profileId),
+    });
+    if (!response.ok) throw new Error('Failed to fetch playback progress');
+    return response.json();
+  },
+
+  async savePlaybackProgress(itemId: number, payload: { position?: number; duration?: number; path?: string | null }, profileId?: string): Promise<any> {
+    const pid = profileId ? `?profile_id=${encodeURIComponent(profileId)}` : '';
+    const response = await fetchWithFallback(`${API_BASE}/media/${itemId}/progress${pid}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(profileHeaders(profileId) || {}) },
+      body: JSON.stringify(payload || {}),
+    });
+    if (!response.ok) throw new Error('Failed to save playback progress');
     return response.json();
   },
 
@@ -515,32 +808,6 @@ export const MediaService = {
     return response.json();
   },
 
-  async startLocalization(limitSeries?: number, limitSeasons?: number): Promise<any> {
-    try {
-      const qs: string[] = [];
-      if (typeof limitSeries === 'number') qs.push(`limit_series=${encodeURIComponent(String(limitSeries))}`);
-      if (typeof limitSeasons === 'number') qs.push(`limit_seasons=${encodeURIComponent(String(limitSeasons))}`);
-      const url = qs.length ? `${API_BASE}/localize/start?${qs.join('&')}` : `${API_BASE}/localize/start`;
-      const res = await fetchWithFallback(url, { method: 'POST', headers: adminHeaders() });
-      let data = null;
-      try { data = await res.json(); } catch (e) { data = null; }
-      return { ok: res.ok, data };
-    } catch (e) {
-      return { ok: false, error: String(e) };
-    }
-  },
-
-  async stopLocalization(): Promise<any> {
-    try {
-      const res = await fetchWithFallback(`${API_BASE}/localize/stop`, { method: 'POST', headers: adminHeaders() });
-      let data = null;
-      try { data = await res.json(); } catch (e) { data = null; }
-      return { ok: res.ok, data };
-    } catch (e) {
-      return { ok: false, error: String(e) };
-    }
-  },
-
   async startEnrichment(): Promise<any> {
     try {
       const res = await fetchWithFallback(`${API_BASE}/enrich/start`, { method: 'POST', headers: adminHeadersAny() });
@@ -566,11 +833,49 @@ export const MediaService = {
     }
   },
 
-  async resetNoMatch(): Promise<any> {
+  async backfillImages(limitItems?: number): Promise<any> {
     try {
-      const res = await fetchWithFallback(`${API_BASE}/enrich/reset-no-match`, { method: 'POST', headers: adminHeadersAny() });
+      const url = typeof limitItems === 'number'
+        ? `${API_BASE}/enrich/backfill-images?limit_items=${encodeURIComponent(String(limitItems))}`
+        : `${API_BASE}/enrich/backfill-images`;
+      const res = await fetchWithFallback(url, { method: 'POST', headers: adminHeadersAny() });
       let data = null;
       try { data = await res.json(); } catch (e) { data = null; }
+      return { ok: res.ok, data };
+    } catch (e) {
+      return { ok: false, error: String(e) };
+    }
+  },
+
+  async resetNoMatch(): Promise<any> {
+    // Back-compat: default behavior (no options).
+    return this.resetNoMatchWithOptions();
+  },
+
+  async resetNoMatchWithOptions(opts?: { animeProvider?: 'jikan' | 'kitsu' | 'tmdb' | 'auto'; start?: boolean }): Promise<any> {
+    try {
+      const qp: string[] = [];
+      if (opts?.animeProvider) qp.push(`anime_provider=${encodeURIComponent(String(opts.animeProvider))}`);
+      if (typeof opts?.start === 'boolean') qp.push(`start=${encodeURIComponent(String(opts.start))}`);
+      const url = qp.length ? `${API_BASE}/enrich/reset-no-match?${qp.join('&')}` : `${API_BASE}/enrich/reset-no-match`;
+      const res = await fetchWithFallback(url, { method: 'POST', headers: adminHeadersAny() });
+      let data = null;
+      try { data = await res.json(); } catch { data = null; }
+      return { ok: res.ok, data };
+    } catch (e) {
+      return { ok: false, error: String(e) };
+    }
+  },
+
+  async resetError(opts?: { animeProvider?: 'jikan' | 'kitsu' | 'tmdb' | 'auto'; start?: boolean }): Promise<any> {
+    try {
+      const qp: string[] = [];
+      if (opts?.animeProvider) qp.push(`anime_provider=${encodeURIComponent(String(opts.animeProvider))}`);
+      if (typeof opts?.start === 'boolean') qp.push(`start=${encodeURIComponent(String(opts.start))}`);
+      const url = qp.length ? `${API_BASE}/enrich/reset-error?${qp.join('&')}` : `${API_BASE}/enrich/reset-error`;
+      const res = await fetchWithFallback(url, { method: 'POST', headers: adminHeadersAny() });
+      let data = null;
+      try { data = await res.json(); } catch { data = null; }
       return { ok: res.ok, data };
     } catch (e) {
       return { ok: false, error: String(e) };
@@ -604,23 +909,38 @@ export const MediaService = {
     }
   },
 
-  async addRoot(path: string): Promise<string[]> {
+  async getRootsDetailed(): Promise<RootObj[]> {
     try {
+      const res = await fetchWithFallback(`${API_BASE}/roots`, { headers: adminHeadersAny() });
+      if (!res.ok) throw new Error('Failed to fetch roots');
+      const data = await res.json();
+      return Array.isArray(data.roots) ? data.roots : [];
+    } catch (e) {
+      console.warn('Failed to fetch roots (detailed)', e);
+      return [];
+    }
+  },
+
+  async addRoot(path: string, type?: string): Promise<RootObj[]> {
+    try {
+      let t = String(type || '').trim().toLowerCase();
+      if (t === 'tv' || t === 'show' || t === 'shows') t = 'series';
+      if (!t || t === 'auto' || t === 'unknown') t = '';
       const res = await fetchWithFallback(`${API_BASE}/roots`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...(adminHeadersAny() || {}) },
-        body: JSON.stringify({ path }),
+        body: JSON.stringify(t ? { path, type: t } : { path }),
       });
       if (!res.ok) throw new Error('Failed to add root');
       const data = await res.json();
-      return normalizeRoots(data.roots);
+      return Array.isArray(data.roots) ? data.roots : [];
     } catch (e) {
       console.warn('Failed to add root', e);
       return [];
     }
   },
 
-  async removeRoot(path: string): Promise<string[]> {
+  async removeRoot(path: string): Promise<RootObj[]> {
     try {
       const res = await fetchWithFallback(`${API_BASE}/roots`, {
         method: 'DELETE',
@@ -629,15 +949,30 @@ export const MediaService = {
       });
       if (!res.ok) throw new Error('Failed to remove root');
       const data = await res.json();
-      return normalizeRoots(data.roots);
+      return Array.isArray(data.roots) ? data.roots : [];
     } catch (e) {
       console.warn('Failed to remove root', e);
       return [];
     }
   },
+
+  async updateRootType(path: string, type: string): Promise<RootObj[]> {
+    const t = String(type || '').trim().toLowerCase();
+    const tNorm = (!t || t === 'auto') ? 'unknown' : (t === 'tv' ? 'series' : t);
+    const res = await fetchWithFallback(`${API_BASE}/roots`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', ...(adminHeadersAny() || {}) },
+      body: JSON.stringify({ path, type: tNorm }),
+    });
+    if (!res.ok) throw new Error('Failed to update root');
+    const data = await res.json();
+    return Array.isArray(data.roots) ? data.roots : [];
+  },
   async getAppConfig(): Promise<any> {
     try {
-      const res = await fetchWithFallback(`${API_BASE}/app-config`);
+      const res = await fetchWithFallback(`${API_BASE}/app-config`, {
+        headers: adminHeadersAny(),
+      });
       if (!res.ok) {
         // Si es 404, el endpoint no existe, retornar objeto vacío
         if (res.status === 404) {
@@ -646,37 +981,98 @@ export const MediaService = {
             setupComplete: false,
             profiles: [],
             metadata: {},
-            media_roots: []
+            media_roots: [],
+            loose_movie_roots: []
           };
         }
         throw new Error(`HTTP ${res.status}: ${res.statusText}`);
       }
       const data = await res.json();
       console.log('App config loaded:', data);
+      try {
+        setTelemetryToken((data as any)?.telemetry_token);
+      } catch {
+        // ignore
+      }
       return data;
     } catch (e) {
       console.warn('Failed to fetch app config, using default:', e);
       // Retornar configuración por defecto
-      return {
-        setupComplete: false,
-        profiles: [],
-        metadata: {
-          moviesProvider: 'tmdb',
-          animeProvider: 'jikan',
-          language: 'en-US',
-          downloadImages: true,
-          fetchCast: true
-        },
-        media_roots: []
+        return {
+          setupComplete: false,
+          profiles: [],
+          metadata: {
+            moviesProvider: 'tmdb',
+            animeProvider: 'kitsu',
+            language: 'en-US',
+            downloadImages: true,
+            fetchCast: true
+          },
+        media_roots: [],
+        loose_movie_roots: []
       };
     }
+  },
+
+  async getLocalizeStatus(): Promise<any> {
+    const res = await fetchWithFallback(`${API_BASE}/localize/status`, { headers: adminHeadersAny() });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  },
+
+  async startLocalize(opts?: { limit_series?: number; limit_seasons?: number }): Promise<any> {
+    const qs: string[] = [];
+    if (opts?.limit_series != null) qs.push(`limit_series=${encodeURIComponent(String(opts.limit_series))}`);
+    if (opts?.limit_seasons != null) qs.push(`limit_seasons=${encodeURIComponent(String(opts.limit_seasons))}`);
+    const url = `${API_BASE}/localize/start${qs.length ? `?${qs.join('&')}` : ''}`;
+    const res = await fetchWithFallback(url, { method: 'POST', headers: adminHeadersAny() });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  },
+
+  async stopLocalize(): Promise<any> {
+    const res = await fetchWithFallback(`${API_BASE}/localize/stop`, { method: 'POST', headers: adminHeadersAny() });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  },
+
+  async runAnimeTranslations(opts?: { limit_items?: number; missing_only?: boolean }): Promise<any> {
+    const qs: string[] = [];
+    if (opts?.limit_items != null) qs.push(`limit_items=${encodeURIComponent(String(opts.limit_items))}`);
+    if (opts?.missing_only != null) qs.push(`missing_only=${encodeURIComponent(String(!!opts.missing_only))}`);
+    const url = `${API_BASE}/localize/anime-translations${qs.length ? `?${qs.join('&')}` : ''}`;
+    const res = await fetchWithFallback(url, { method: 'POST', headers: adminHeadersAny() });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  },
+
+  async getAnimeNormalizeStatus(): Promise<any> {
+    const res = await fetchWithFallback(`${API_BASE}/anime-normalize/status`, { headers: adminHeadersAny() });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  },
+
+  async startAnimeNormalize(opts?: { limit_series?: number; force?: boolean }): Promise<any> {
+    const qs: string[] = [];
+    if (opts?.limit_series != null) qs.push(`limit_series=${encodeURIComponent(String(opts.limit_series))}`);
+    if (opts?.force != null) qs.push(`force=${encodeURIComponent(String(!!opts.force))}`);
+    const url = `${API_BASE}/anime-normalize/start${qs.length ? `?${qs.join('&')}` : ''}`;
+    const res = await fetchWithFallback(url, { method: 'POST', headers: adminHeadersAny() });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  },
+
+  async stopAnimeNormalize(): Promise<any> {
+    const res = await fetchWithFallback(`${API_BASE}/anime-normalize/stop`, { method: 'POST', headers: adminHeadersAny() });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
   },
 
   async saveAppConfig(cfg: any): Promise<any> {
     try {
       const res = await fetchWithFallback(`${API_BASE}/app-config`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...(adminHeadersAny() || {}) },
         body: JSON.stringify(cfg),
       });
 
@@ -727,6 +1123,17 @@ export const MediaService = {
       return { ok: true, token, expires_in: data?.expires_in };
     } catch (e) {
       return { ok: false, detail: String(e) };
+    }
+  },
+
+  async getAdminStatus(): Promise<{ pin_required: boolean }> {
+    try {
+      const res = await fetchWithFallback(`${API_BASE}/admin/status`);
+      if (!res.ok) throw new Error('Failed to fetch admin status');
+      const data = await res.json();
+      return { pin_required: !!data?.pin_required };
+    } catch (e) {
+      return { pin_required: false };
     }
   },
 
@@ -820,6 +1227,22 @@ export const MediaService = {
       return await res.json();
     } catch (e) {
       return { ok: false, detail: String(e) };
+    }
+  },
+
+  async getLanInfo(): Promise<{ hosts: string[]; preferred_host?: string | null; port?: number; download_url?: string | null }> {
+    try {
+      const res = await fetchWithFallback(`${API_BASE}/system/lan-info`);
+      if (!res.ok) throw new Error('Failed to fetch lan info');
+      const data = await res.json();
+      return {
+        hosts: Array.isArray(data?.hosts) ? data.hosts.map((h: any) => String(h)) : [],
+        preferred_host: data?.preferred_host ? String(data.preferred_host) : null,
+        port: typeof data?.port === 'number' ? data.port : Number(data?.port || 0) || undefined,
+        download_url: data?.download_url ? String(data.download_url) : null,
+      };
+    } catch (e) {
+      return { hosts: [], preferred_host: null, port: undefined, download_url: null };
     }
   },
 

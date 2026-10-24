@@ -10,7 +10,6 @@ from fastapi import APIRouter, HTTPException, Depends
 from ...core import config as core_config
 from ...services.dispatch_enrichment import dispatch_enrichment_by_roots
 from ...services.enrichment_runner import start_enrichment_job
-from ...services.localize_runner import start_localization_job
 from ..services.credentials import check_tmdb_connectivity
 from ..deps import admin_required
 
@@ -116,10 +115,6 @@ def _run_tmdb_repair_background() -> None:
                 logging.getLogger(__name__).info("TMDB repair dispatch finished: %s", report)
             except Exception:
                 logging.getLogger(__name__).exception("TMDB repair dispatch failed")
-            try:
-                start_localization_job()
-            except Exception:
-                logging.getLogger(__name__).debug("Localization job failed after TMDB repair", exc_info=True)
 
         threading.Thread(target=_worker, daemon=True, name="tmdb-repair-dispatch").start()
     except Exception:

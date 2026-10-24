@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { X, Search, Check, Loader2 } from 'lucide-react';
+import { X, Search, Check, Loader2, Save } from 'lucide-react';
 import { MediaItem } from '../../types';
 import { Button } from '../ui/Button';
 import { MediaService } from '../../services/api';
@@ -12,11 +12,23 @@ interface ManualMappingModalProps {
 }
 
 type SearchResult = {
-  tmdb_id: string;
-  media_type: 'tv' | 'movie';
+  provider: 'tmdb' | 'jikan' | 'kitsu';
+  tmdb_id?: string;
+  mal_id?: string;
+  kitsu_id?: string;
+  media_type?: 'tv' | 'movie';
   title: string;
   year?: string;
   poster?: string | null;
+};
+
+type LocalSeason = {
+  media_item_id: number;
+  season_id?: number | null;
+  season_number: number | null;
+  title_en?: string | null;
+  title_localized?: string | null;
+  canonical_path?: string | null;
 };
 
 export const ManualMappingModal: React.FC<ManualMappingModalProps> = ({ item, onClose, onSaved }) => {
@@ -42,7 +54,20 @@ export const ManualMappingModal: React.FC<ManualMappingModalProps> = ({ item, on
     return 'en-US';
   }, [lang]);
 
+  const initialProvider = useMemo<'tmdb' | 'jikan' | 'kitsu'>(() => {
+    try {
+      const p = String((item as any)?.rawMetadata?.provider || '').trim().toLowerCase();
+      if (p === 'tmdb' || p === 'jikan' || p === 'kitsu') return p;
+    } catch {
+      // ignore
+    }
+    return item?.type === 'anime' ? 'kitsu' : 'tmdb';
+  }, [item]);
+  const [provider, setProvider] = useState<'tmdb' | 'jikan' | 'kitsu'>(initialProvider);
   const [query, setQuery] = useState(item.title || '');
+  const [tmdbIdInput, setTmdbIdInput] = useState('');
+  const [malIdInput, setMalIdInput] = useState('');
+  const [kitsuIdInput, setKitsuIdInput] = useState('');
   const [language, setLanguage] = useState(defaultLang);
   const [results, setResults] = useState<SearchResult[]>([]);
   const [selected, setSelected] = useState<SearchResult | null>(null);
@@ -57,14 +82,47 @@ export const ManualMappingModal: React.FC<ManualMappingModalProps> = ({ item, on
   const [backdrops, setBackdrops] = useState<string[]>([]);
   const [posterSelected, setPosterSelected] = useState<string | null>(null);
   const [backdropSelected, setBackdropSelected] = useState<string | null>(null);
+  // Stable artwork pick for "bulk apply to seasons".
+  // Prevents copying a season-specific poster/backdrop to every season.
+  const [seriesPosterSelected, setSeriesPosterSelected] = useState<string | null>(null);
+  const [seriesBackdropSelected, setSeriesBackdropSelected] = useState<string | null>(null);
   const [expandedImage, setExpandedImage] = useState<string | null>(null);
   const [posterLimit, setPosterLimit] = useState(12);
   const [backdropLimit, setBackdropLimit] = useState(6);
   const [busy, setBusy] = useState(false);
   const [seasonLoading, setSeasonLoading] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
-  const [downloadAssets, setDownloadAssets] = useState(false);
-  const [extraLanguages, setExtraLanguages] = useState<string[]>([]);
+  const [downloadAssets, setDownloadAssets] = useState(true);
+  const [fetchEpisodesJikan, setFetchEpisodesJikan] = useState(false);
+  const [advancedTmdbId, setAdvancedTmdbId] = useState('');
+  const [advancedMediaType, setAdvancedMediaType] = useState<'tv' | 'movie'>('tv');
+  const [advancedSeasonNumber, setAdvancedSeasonNumber] = useState('');
+  const [seriesOverview, setSeriesOverview] = useState<string>('');
+  const [localSeasons, setLocalSeasons] = useState<LocalSeason[]>([]);
+  const [applyToSeasonIds, setApplyToSeasonIds] = useState<number[]>([]);
+  const [localSeasonsLoading, setLocalSeasonsLoading] = useState(false);
+
+  const localSeasonByItemId = useMemo(() => {
+    const m = new Map<number, LocalSeason>();
+    (localSeasons || []).forEach((s) => {
+      const mid = Number((s as any)?.media_item_id);
+      if (Number.isFinite(mid) && mid > 0) m.set(mid, s);
+    });
+    return m;
+  }, [localSeasons]);
+
+  const sortedLocalSeasons = useMemo(() => {
+    const arr = [...(localSeasons || [])];
+    arr.sort((a, b) => {
+      const an = a?.season_number ?? null;
+      const bn = b?.season_number ?? null;
+      if (typeof an === 'number' && typeof bn === 'number' && an !== bn) return an - bn;
+      if (typeof an === 'number' && typeof bn !== 'number') return -1;
+      if (typeof an !== 'number' && typeof bn === 'number') return 1;
+      return (a?.media_item_id || 0) - (b?.media_item_id || 0);
+    });
+    return arr;
+  }, [localSeasons]);
 
   const displayEpisodeMap = useMemo(() => {
     const kept = episodes.filter(e => e.keep !== false);
@@ -81,16 +139,155 @@ export const ManualMappingModal: React.FC<ManualMappingModalProps> = ({ item, on
   }, [defaultLang]);
 
   useEffect(() => {
-    setExtraLanguages((prev) => prev.filter((l) => l !== language));
-  }, [language]);
+    setProvider(initialProvider);
+  }, [initialProvider]);
+
+  useEffect(() => {
+    const itemId = Number(item?.id);
+    if (!Number.isFinite(itemId) || itemId <= 0) {
+      setLocalSeasons([]);
+      setApplyToSeasonIds([]);
+      return;
+    }
+    setApplyToSeasonIds([itemId]);
+    if (item?.type !== 'series') {
+      setLocalSeasons([]);
+      return;
+    }
+    setLocalSeasonsLoading(true);
+    MediaService.manualLocalSeasons(itemId)
+      .then((res: any) => {
+        const list = Array.isArray(res?.seasons) ? res.seasons : [];
+        const normalized: LocalSeason[] = list
+          .map((s: any) => ({
+            media_item_id: Number(s?.media_item_id || 0),
+            season_id: s?.season_id != null ? Number(s.season_id) : null,
+            season_number: s?.season_number != null ? Number(s.season_number) : null,
+            title_en: s?.title_en || null,
+            title_localized: s?.title_localized || null,
+            canonical_path: s?.canonical_path || null,
+          }))
+          .filter((s: LocalSeason) => Number.isFinite(s.media_item_id) && s.media_item_id > 0);
+        setLocalSeasons(normalized);
+        // Keep default selection as "only this item" to avoid accidental bulk writes.
+        setApplyToSeasonIds([itemId]);
+      })
+      .catch((e: any) => {
+        console.warn('manualLocalSeasons failed', e);
+        setLocalSeasons([]);
+        setApplyToSeasonIds([itemId]);
+      })
+      .finally(() => setLocalSeasonsLoading(false));
+  }, [item?.id, item?.type]);
+
+  useEffect(() => {
+    if (provider !== 'tmdb') return;
+    if (!advancedTmdbId && selected?.tmdb_id) {
+      setAdvancedTmdbId(String(selected.tmdb_id));
+    }
+    if (selected?.media_type) {
+      setAdvancedMediaType(selected.media_type === 'movie' ? 'movie' : 'tv');
+    }
+  }, [provider, selected, advancedTmdbId]);
+
+  useEffect(() => {
+    setResults([]);
+    setSelected(null);
+    setSeasons([]);
+    setSeasonNumber(null);
+    setEpisodes([]);
+    setSeasonTitle('');
+    setTmdbIdInput('');
+    setMalIdInput('');
+    setKitsuIdInput('');
+  }, [provider]);
 
   const handleSearch = async () => {
     setBusy(true);
     setMessage(null);
     try {
-      const res = await MediaService.manualSearchTmdb(query, language);
-      const list = Array.isArray(res?.results) ? res.results : [];
-      setResults(list);
+      if (provider === 'jikan') {
+        if (malIdInput.trim()) {
+          const detail = await MediaService.manualJikanDetails(malIdInput.trim());
+          const r: SearchResult = {
+            provider: 'jikan',
+            mal_id: malIdInput.trim(),
+            media_type: (detail?.media_type === 'movie' ? 'movie' : 'tv') as 'movie' | 'tv',
+            title: detail?.title || '',
+            year: detail?.year || '',
+            poster: detail?.poster || null,
+          };
+          setResults([r]);
+          setSelected(r);
+          loadDetails(r);
+          return;
+        }
+        const res = await MediaService.manualSearchJikan(query);
+        const list = Array.isArray(res?.results) ? res.results : [];
+        const normalized = list.map((r: any) => ({
+          provider: 'jikan' as const,
+          mal_id: String(r?.mal_id ?? r?.id ?? '').trim(),
+          media_type: (r?.media_type === 'movie' ? 'movie' : 'tv') as 'movie' | 'tv',
+          title: r?.title || '',
+          year: r?.year || '',
+          poster: r?.poster || null,
+        }));
+        setResults(normalized);
+      } else if (provider === 'kitsu') {
+        if (kitsuIdInput.trim()) {
+          const detail = await MediaService.manualKitsuDetails(kitsuIdInput.trim());
+          const r: SearchResult = {
+            provider: 'kitsu',
+            kitsu_id: kitsuIdInput.trim(),
+            media_type: (detail?.media_type === 'movie' ? 'movie' : 'tv') as 'movie' | 'tv',
+            title: detail?.title || '',
+            year: detail?.year || '',
+            poster: detail?.poster || null,
+          };
+          setResults([r]);
+          setSelected(r);
+          loadDetails(r);
+          return;
+        }
+        const res = await MediaService.manualSearchKitsu(query);
+        const list = Array.isArray(res?.results) ? res.results : [];
+        const normalized = list.map((r: any) => ({
+          provider: 'kitsu' as const,
+          kitsu_id: String(r?.kitsu_id ?? r?.id ?? '').trim(),
+          media_type: (r?.media_type === 'movie' ? 'movie' : 'tv') as 'movie' | 'tv',
+          title: r?.title || '',
+          year: r?.year || '',
+          poster: r?.poster || null,
+        }));
+        setResults(normalized);
+      } else {
+        if (tmdbIdInput.trim()) {
+          const detail = await MediaService.manualTmdbDetails(tmdbIdInput.trim(), 'tv', language);
+          const r: SearchResult = {
+            provider: 'tmdb',
+            tmdb_id: tmdbIdInput.trim(),
+            media_type: 'tv',
+            title: detail?.title || '',
+            year: detail?.year || '',
+            poster: detail?.poster || null,
+          };
+          setResults([r]);
+          setSelected(r);
+          loadDetails(r);
+          return;
+        }
+        const res = await MediaService.manualSearchTmdb(query, language);
+        const list = Array.isArray(res?.results) ? res.results : [];
+        const normalized = list.map((r: any) => ({
+          provider: 'tmdb' as const,
+          tmdb_id: String(r?.tmdb_id ?? r?.id ?? '').trim(),
+          media_type: (r?.media_type === 'movie' ? 'movie' : 'tv') as 'movie' | 'tv',
+          title: r?.title || '',
+          year: r?.year || '',
+          poster: r?.poster || null,
+        }));
+        setResults(normalized);
+      }
     } catch (e: any) {
       setMessage(String(e?.message || e));
       setResults([]);
@@ -103,27 +300,72 @@ export const ManualMappingModal: React.FC<ManualMappingModalProps> = ({ item, on
     setBusy(true);
     setMessage(null);
     try {
-      const detail = await MediaService.manualTmdbDetails(r.tmdb_id, r.media_type, language);
-      setTitle(detail?.title || r.title || '');
-      setOverview(detail?.overview || '');
-      setGenres(Array.isArray(detail?.genres) ? detail.genres : []);
-      const posters = Array.isArray(detail?.posters) ? detail.posters : [];
-      const backdrops = Array.isArray(detail?.backdrops) ? detail.backdrops : [];
-      const posterPick = posters[0] || detail?.poster || r.poster || null;
-      const backdropPick = backdrops[0] || detail?.backdrop || null;
-      setPosters(posters.length ? posters : (detail?.poster ? [detail.poster] : []));
-      setBackdrops(backdrops.length ? backdrops : (detail?.backdrop ? [detail.backdrop] : []));
-      setPosterSelected(posterPick);
-      setBackdropSelected(backdropPick);
-      setPosterLimit(12);
-      setBackdropLimit(6);
-      if (r.media_type === 'tv') {
-        const s = await MediaService.manualTmdbSeasons(r.tmdb_id, language);
-        setSeasons(Array.isArray(s?.seasons) ? s.seasons : []);
-      } else {
+      if (r.provider === 'jikan') {
+        const detail = await MediaService.manualJikanDetails(String(r.mal_id || ''));
+        setTitle(detail?.title || r.title || '');
+        setOverview(detail?.overview || '');
+        setSeriesOverview(detail?.overview || '');
+        setGenres(Array.isArray(detail?.genres) ? detail.genres : []);
+        const posters = Array.isArray(detail?.posters) ? detail.posters : [];
+        const posterPick = posters[0] || detail?.poster || r.poster || null;
+        setPosters(posters.length ? posters : (detail?.poster ? [detail.poster] : []));
+        setBackdrops([]);
+        setPosterSelected(posterPick);
+        setBackdropSelected(null);
+        setSeriesPosterSelected(posterPick);
+        setSeriesBackdropSelected(null);
+        setPosterLimit(12);
+        setBackdropLimit(6);
         setSeasons([]);
         setSeasonNumber(null);
         setEpisodes([]);
+      } else if (r.provider === 'kitsu') {
+        const detail = await MediaService.manualKitsuDetails(String(r.kitsu_id || ''));
+        setTitle(detail?.title || r.title || '');
+        setOverview(detail?.overview || '');
+        setSeriesOverview(detail?.overview || '');
+        setGenres(Array.isArray(detail?.genres) ? detail.genres : []);
+        const posters = Array.isArray(detail?.posters) ? detail.posters : [];
+        const backdrops = Array.isArray(detail?.backdrops) ? detail.backdrops : [];
+        const posterPick = posters[0] || detail?.poster || r.poster || null;
+        const backdropPick = backdrops[0] || detail?.backdrop || null;
+        setPosters(posters.length ? posters : (detail?.poster ? [detail.poster] : []));
+        setBackdrops(backdrops.length ? backdrops : (detail?.backdrop ? [detail.backdrop] : []));
+        setPosterSelected(posterPick);
+        setBackdropSelected(backdropPick);
+        setSeriesPosterSelected(posterPick);
+        setSeriesBackdropSelected(backdropPick);
+        setPosterLimit(12);
+        setBackdropLimit(6);
+        setSeasons([]);
+        setSeasonNumber(null);
+        setEpisodes([]);
+      } else {
+        const detail = await MediaService.manualTmdbDetails(String(r.tmdb_id || ''), r.media_type || 'tv', language);
+        setTitle(detail?.title || r.title || '');
+        setOverview(detail?.overview || '');
+        setSeriesOverview(detail?.overview || '');
+        setGenres(Array.isArray(detail?.genres) ? detail.genres : []);
+        const posters = Array.isArray(detail?.posters) ? detail.posters : [];
+        const backdrops = Array.isArray(detail?.backdrops) ? detail.backdrops : [];
+        const posterPick = posters[0] || detail?.poster || r.poster || null;
+        const backdropPick = backdrops[0] || detail?.backdrop || null;
+        setPosters(posters.length ? posters : (detail?.poster ? [detail.poster] : []));
+        setBackdrops(backdrops.length ? backdrops : (detail?.backdrop ? [detail.backdrop] : []));
+        setPosterSelected(posterPick);
+        setBackdropSelected(backdropPick);
+        setSeriesPosterSelected(posterPick);
+        setSeriesBackdropSelected(backdropPick);
+        setPosterLimit(12);
+        setBackdropLimit(6);
+        if (r.media_type === 'tv') {
+          const s = await MediaService.manualTmdbSeasons(String(r.tmdb_id || ''), language);
+          setSeasons(Array.isArray(s?.seasons) ? s.seasons : []);
+        } else {
+          setSeasons([]);
+          setSeasonNumber(null);
+          setEpisodes([]);
+        }
       }
     } catch (e: any) {
       setMessage(String(e?.message || e));
@@ -133,11 +375,11 @@ export const ManualMappingModal: React.FC<ManualMappingModalProps> = ({ item, on
   };
 
   const loadSeason = async (sn: number) => {
-    if (!selected) return;
+    if (!selected || selected.provider !== 'tmdb') return;
     setSeasonLoading(true);
     setMessage(null);
     try {
-      const d = await MediaService.manualTmdbSeasonDetails(selected.tmdb_id, sn, language);
+      const d = await MediaService.manualTmdbSeasonDetails(String(selected.tmdb_id || ''), sn, language);
       const eps = Array.isArray(d?.episodes) ? d.episodes : [];
       setSeasonTitle(d?.title || '');
       setOverview(d?.overview || '');
@@ -166,60 +408,161 @@ export const ManualMappingModal: React.FC<ManualMappingModalProps> = ({ item, on
     }
   };
 
+  const handleAdvancedLoad = async () => {
+    if (provider !== 'tmdb') return;
+    const tid = String(advancedTmdbId || '').trim();
+    if (!tid) {
+      setMessage('TMDB ID requerido');
+      return;
+    }
+    setBusy(true);
+    setMessage(null);
+    try {
+      const r: SearchResult = {
+        provider: 'tmdb',
+        tmdb_id: tid,
+        media_type: advancedMediaType,
+        title: tid,
+      };
+      setSelected(r);
+      setResults([r]);
+
+      const detail = await MediaService.manualTmdbDetails(tid, advancedMediaType, language);
+      setTitle(detail?.title || r.title || '');
+      const baseOverview = detail?.overview || '';
+      setOverview(baseOverview);
+      setSeriesOverview(baseOverview);
+      setGenres(Array.isArray(detail?.genres) ? detail.genres : []);
+      const posters = Array.isArray(detail?.posters) ? detail.posters : [];
+      const backdrops = Array.isArray(detail?.backdrops) ? detail.backdrops : [];
+      const posterPick = posters[0] || detail?.poster || null;
+      const backdropPick = backdrops[0] || detail?.backdrop || null;
+      setPosters(posters.length ? posters : (detail?.poster ? [detail.poster] : []));
+      setBackdrops(backdrops.length ? backdrops : (detail?.backdrop ? [detail.backdrop] : []));
+      setPosterSelected(posterPick);
+      setBackdropSelected(backdropPick);
+      setSeriesPosterSelected(posterPick);
+      setSeriesBackdropSelected(backdropPick);
+      setPosterLimit(12);
+      setBackdropLimit(6);
+
+      if (advancedMediaType === 'tv') {
+        const snRaw = String(advancedSeasonNumber || '').trim();
+        const sn = snRaw ? Number(snRaw) : null;
+        if (sn && Number.isFinite(sn)) {
+          const seasonDetail = await MediaService.manualTmdbSeasonDetails(tid, sn, language);
+          const eps = Array.isArray(seasonDetail?.episodes) ? seasonDetail.episodes : [];
+          setSeasonTitle(seasonDetail?.title || '');
+          setOverview(seasonDetail?.overview || baseOverview);
+          setEpisodes(
+            eps.map((e: any) => ({
+              episode_number: Number(e?.episode_number || 0),
+              title: e?.title || '',
+              overview: e?.overview || '',
+              keep: true,
+            }))
+          );
+          setSeasonNumber(sn);
+          setSeasons([{ season_number: sn, name: seasonDetail?.title || '' }]);
+        } else {
+          setSeasonNumber(null);
+          setSeasons([]);
+          setEpisodes([]);
+          setSeasonTitle('');
+        }
+      } else {
+        setSeasonNumber(null);
+        setSeasons([]);
+        setEpisodes([]);
+        setSeasonTitle('');
+      }
+    } catch (e: any) {
+      setMessage(String(e?.message || e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const handleApply = async () => {
     if (!selected) return;
     setBusy(true);
     setMessage(null);
     try {
-      const payload = {
-        tmdb_id: selected.tmdb_id,
-        media_type: selected.media_type,
-        season_number: seasonNumber,
-        language,
-        title: title || seasonTitle || selected.title,
-        overview,
-        genres,
-        poster_url: posterSelected,
-        backdrop_url: backdropSelected,
-        season_title: seasonTitle || title || '',
-        download_assets: downloadAssets,
-        episode_overrides: (() => {
-          const kept = episodes.filter(e => e.keep !== false);
-          const ordered = kept.sort((a, b) => (a.episode_number || 0) - (b.episode_number || 0));
-          return ordered.map((e, idx) => ({
-            episode_number: idx + 1,
-            original_episode_number: e.episode_number,
-            title: e.title,
-            overview: e.overview,
-          }));
-        })(),
-      };
-      const res = await MediaService.manualApplyMapping(Number(item.id), payload);
-      if (!res?.ok) throw new Error(res?.detail || 'save_failed');
-      const extras = extraLanguages.filter((l) => l && l !== language);
-      for (const lang of extras) {
-        try {
-          const detail = await MediaService.manualTmdbDetails(selected.tmdb_id, selected.media_type, lang);
-          await MediaService.manualApplyMapping(Number(item.id), {
-            tmdb_id: selected.tmdb_id,
-            media_type: selected.media_type,
-            season_number: seasonNumber,
-            language: lang,
-            title: detail?.title || selected.title,
-            overview: detail?.overview || '',
-            genres: Array.isArray(detail?.genres) ? detail.genres : [],
-            poster_url: null,
-            backdrop_url: null,
-            season_title: null,
-            download_assets: false,
-            episode_overrides: [],
-            translation_only: true,
-          });
-        } catch {
-          // Best-effort for extra languages; keep primary save.
+      const itemId = Number(item.id);
+      const targets: number[] = Array.from(new Set(applyToSeasonIds)).filter((n): n is number => (
+        typeof n === 'number' && Number.isFinite(n) && n > 0
+      ));
+      const target0: number = targets[0] ?? (Number.isFinite(itemId) ? itemId : Number(item.id));
+      const isBulkSeriesApply = provider === 'tmdb' && selected.provider === 'tmdb' && selected.media_type === 'tv' && targets.length > 1;
+
+      if (isBulkSeriesApply) {
+        const basePayload = {
+          provider,
+          tmdb_id: selected.tmdb_id,
+          mal_id: null,
+          kitsu_id: null,
+          media_type: selected.media_type,
+          // season_number will be set per item (from local DB) to preserve the correct season mapping.
+          season_number: null as number | null,
+          language,
+          // Bulk apply is identity-first; avoid overwriting per-season title/overview.
+          title: null,
+          overview: null,
+          genres,
+          // Use stable series artwork for bulk apply (not a season-specific selection).
+          poster_url: seriesPosterSelected,
+          backdrop_url: seriesBackdropSelected,
+          // Bulk apply is for identity + stable artwork; don't overwrite season titles or renumber episodes.
+          season_title: null,
+          download_assets: true,
+          fetch_episodes: false,
+          episode_overrides: [],
+        };
+        for (let i = 0; i < targets.length; i++) {
+          const targetId = targets[i];
+          const localSeasonNumber = localSeasonByItemId.get(targetId)?.season_number ?? null;
+          const payload = { ...basePayload, season_number: localSeasonNumber };
+          setMessage(`${t('saving')} (${i + 1}/${targets.length})`);
+          const res = await MediaService.manualApplyMapping(targetId, payload);
+          if (!res?.ok) throw new Error(res?.error || res?.detail || 'save_failed');
         }
+      } else {
+        const payload = {
+          provider,
+          tmdb_id: provider === 'tmdb' ? selected.tmdb_id : null,
+          mal_id: provider === 'jikan' ? selected.mal_id : null,
+          kitsu_id: provider === 'kitsu' ? selected.kitsu_id : null,
+          media_type: provider === 'tmdb' ? selected.media_type : null,
+          season_number: seasonNumber,
+          language,
+          title: title || seasonTitle || selected.title,
+          overview,
+          genres,
+          poster_url: posterSelected,
+          backdrop_url: backdropSelected,
+          season_title: seasonTitle || title || '',
+          download_assets: true,
+          fetch_episodes: fetchEpisodesJikan,
+          episode_overrides: provider === 'tmdb' ? (() => {
+            const kept = episodes.filter(e => e.keep !== false);
+            const ordered = kept.sort((a, b) => (a.episode_number || 0) - (b.episode_number || 0));
+            return ordered.map((e, idx) => ({
+              episode_number: idx + 1,
+              original_episode_number: e.episode_number,
+              title: e.title,
+              overview: e.overview,
+            }));
+          })() : [],
+        };
+        const res = await MediaService.manualApplyMapping(target0, payload);
+        if (!res?.ok) throw new Error(res?.error || res?.detail || 'save_failed');
       }
-      setMessage(t('saved'));
+      
+      setMessage(t('saved_successfully'));
+      
+      // Auto-clear message after 3 seconds
+      setTimeout(() => setMessage(null), 3000);
+      
       if (onSaved) onSaved();
     } catch (e: any) {
       setMessage(String(e?.message || e));
@@ -228,8 +571,8 @@ export const ManualMappingModal: React.FC<ManualMappingModalProps> = ({ item, on
     }
   };
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 sm:p-6 animate-fade-in">
+  const content = (
+    <div className="fixed inset-0 z-[260] flex items-center justify-center p-4 sm:p-6 animate-fade-in">
       <div className="absolute inset-0 bg-black/70 backdrop-blur-md" onClick={onClose} />
       <div className="relative w-full max-w-5xl bg-[#18181b] rounded-2xl overflow-hidden shadow-2xl border border-white/10 flex flex-col max-h-[90vh]">
         <button
@@ -239,18 +582,76 @@ export const ManualMappingModal: React.FC<ManualMappingModalProps> = ({ item, on
           <X size={22} />
         </button>
 
-        <div className="px-6 pt-6 pb-4 border-b border-white/10">
-          <h3 className="text-xl text-white font-semibold">{t('manual_mapping_title')}</h3>
-          <p className="text-sm text-slate-400">{t('manual_mapping_subtitle')}</p>
+        <div className="px-6 pt-6 pb-4 border-b border-white/10 flex items-center justify-between">
+          <div>
+            <h3 className="text-xl text-white font-semibold">{t('manual_mapping_title')}</h3>
+            <p className="text-sm text-slate-400">{t('manual_mapping_subtitle')}</p>
+          </div>
+          {message && (
+            <div className={`px-4 py-2 rounded-xl text-sm font-black animate-in zoom-in-95 duration-300 ${message.toLowerCase().includes('failed') || message.toLowerCase().includes('error') ? 'bg-red-500/20 text-red-400 border border-red-500/30' : 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 shadow-[0_0_20px_rgba(16,185,129,0.2)]'}`}>
+              {message}
+            </div>
+          )}
         </div>
 
         <div className="flex-1 overflow-y-auto px-6 py-5 space-y-6">
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div className="md:col-span-2 space-y-3">
+              <div className="flex items-center gap-2 text-sm text-slate-300">
+                <span>{t('manual_mapping_provider')}:</span>
+                <select
+                  className="bg-black/30 border border-white/10 rounded-lg px-2 py-1 text-white"
+                  value={provider}
+                  onChange={(e) => setProvider(e.target.value as 'tmdb' | 'jikan' | 'kitsu')}
+                >
+                  <option value="tmdb">{t('manual_mapping_provider_tmdb')}</option>
+                  <option value="kitsu">{t('manual_mapping_provider_kitsu')}</option>
+                  <option value="jikan">{t('manual_mapping_provider_jikan')}</option>
+                </select>
+              </div>
+              {provider === 'tmdb' ? (
+                <div className="mt-2 p-3 rounded-xl bg-white/5 border border-white/10">
+                  <div className="text-[11px] uppercase tracking-wider text-slate-400 mb-2">
+                    {t('manual_mapping_advanced')}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <input
+                      className="w-40 bg-black/30 border border-white/10 rounded-lg px-2 py-1 text-white text-xs"
+                      placeholder={t('manual_mapping_tmdb_id_existing')}
+                      value={advancedTmdbId}
+                      onChange={(e) => setAdvancedTmdbId(e.target.value)}
+                    />
+                    <select
+                      className="bg-black/30 border border-white/10 rounded-lg px-2 py-1 text-white text-xs"
+                      value={advancedMediaType}
+                      onChange={(e) => setAdvancedMediaType(e.target.value as 'tv' | 'movie')}
+                    >
+                      <option value="tv">TV</option>
+                      <option value="movie">Movie</option>
+                    </select>
+                    <input
+                      className="w-24 bg-black/30 border border-white/10 rounded-lg px-2 py-1 text-white text-xs"
+                      placeholder={t('manual_mapping_season_number')}
+                      value={advancedSeasonNumber}
+                      onChange={(e) => setAdvancedSeasonNumber(e.target.value)}
+                    />
+                    <Button onClick={handleAdvancedLoad} disabled={busy}>
+                      {t('manual_mapping_load_by_id')}
+                    </Button>
+                  </div>
+                  <div className="mt-2 text-[11px] text-slate-500">
+                    {`TMDB /tv/{id}/season/{#}`}
+                  </div>
+                </div>
+              ) : null}
               <div className="flex gap-2">
                 <input
                   className="flex-1 bg-black/30 border border-white/10 rounded-lg px-3 py-2 text-white"
-                  placeholder={t('manual_mapping_search_placeholder')}
+                  placeholder={provider === 'jikan'
+                    ? t('manual_mapping_search_placeholder_jikan')
+                    : provider === 'kitsu'
+                      ? t('manual_mapping_search_placeholder_kitsu')
+                      : t('manual_mapping_search_placeholder_tmdb')}
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
                   onKeyDown={(e) => {
@@ -260,6 +661,21 @@ export const ManualMappingModal: React.FC<ManualMappingModalProps> = ({ item, on
                     }
                   }}
                 />
+                {provider === 'tmdb' ? (
+                  <input
+                    className="w-24 bg-black/30 border border-white/10 rounded-lg px-2 py-1 text-white text-xs"
+                    placeholder="TMDB ID"
+                    value={tmdbIdInput}
+                    onChange={(e) => setTmdbIdInput(e.target.value)}
+                  />
+                ) : (
+                  <input
+                    className="w-24 bg-black/30 border border-white/10 rounded-lg px-2 py-1 text-white text-xs"
+                    placeholder={provider === 'kitsu' ? 'KITSU ID' : 'MAL ID'}
+                    value={provider === 'kitsu' ? kitsuIdInput : malIdInput}
+                    onChange={(e) => (provider === 'kitsu' ? setKitsuIdInput(e.target.value) : setMalIdInput(e.target.value))}
+                  />
+                )}
                 <Button icon={<Search size={16} />} onClick={handleSearch} disabled={busy}>
                   {t('manual_mapping_search')}
                 </Button>
@@ -270,49 +686,47 @@ export const ManualMappingModal: React.FC<ManualMappingModalProps> = ({ item, on
                   className="bg-black/30 border border-white/10 rounded-lg px-2 py-1 text-white"
                   value={language}
                   onChange={(e) => setLanguage(e.target.value)}
+                  disabled={provider === 'jikan' || provider === 'kitsu'}
                 >
                   {languageOptions.map((opt) => (
                     <option key={opt.value} value={opt.value}>{opt.label}</option>
                   ))}
                 </select>
-                <label className="ml-3 inline-flex items-center gap-2 text-xs text-slate-300">
+                <label className="ml-3 inline-flex items-center gap-2 text-xs text-slate-300 cursor-pointer hover:text-white transition-colors">
                   <input
                     type="checkbox"
-                    className="accent-indigo-500"
-                    checked={downloadAssets}
-                    onChange={(e) => setDownloadAssets(e.target.checked)}
+                    className="accent-indigo-500 w-4 h-4 rounded border-white/10 bg-black/30"
+                    checked={true}
+                    disabled
+                    onChange={() => setDownloadAssets(true)}
                   />
                   {t('download_assets_local')}
                 </label>
-              </div>
-              <div className="flex flex-wrap items-center gap-2 text-xs text-slate-300">
-                <span className="text-slate-400">{t('save_also_in')}</span>
-                {languageOptions.map((opt) => (
-                  <label key={opt.value} className="inline-flex items-center gap-1 bg-white/5 border border-white/10 rounded-full px-2 py-1">
+                {provider === 'jikan' && (
+                  <label className="ml-3 inline-flex items-center gap-2 text-xs text-slate-300 cursor-pointer hover:text-white transition-colors animate-in fade-in slide-in-from-left-2">
                     <input
                       type="checkbox"
-                      className="accent-indigo-500"
-                      checked={extraLanguages.includes(opt.value)}
-                      disabled={opt.value === language}
-                      onChange={(e) => {
-                        const checked = e.target.checked;
-                        setExtraLanguages((prev) => {
-                          if (opt.value === language) return prev;
-                          return checked
-                            ? Array.from(new Set([...prev, opt.value]))
-                            : prev.filter((l) => l !== opt.value);
-                        });
-                      }}
+                      className="accent-indigo-500 w-4 h-4 rounded border-white/10 bg-black/30"
+                      checked={fetchEpisodesJikan}
+                      onChange={(e) => setFetchEpisodesJikan(e.target.checked)}
                     />
-                    <span>{opt.label}</span>
+                    {t('fetch_episodes_jikan')}
                   </label>
-                ))}
+                )}
               </div>
-
               <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                {(selected ? results.filter(r => r.tmdb_id === selected.tmdb_id && r.media_type === selected.media_type) : results).map((r) => (
+                {(selected ? results.filter(r => {
+                  if (r.provider !== selected.provider) return false;
+                  const idOk =
+                    r.provider === 'jikan'
+                      ? r.mal_id === selected.mal_id
+                      : r.provider === 'kitsu'
+                        ? r.kitsu_id === selected.kitsu_id
+                        : r.tmdb_id === selected.tmdb_id;
+                  return idOk && r.media_type === selected.media_type;
+                }) : results).map((r) => (
                   <button
-                    key={`${r.media_type}-${r.tmdb_id}`}
+                    key={`${r.provider}-${r.media_type}-${r.tmdb_id || r.mal_id || r.kitsu_id}`}
                     onClick={() => {
                       setSelected(r);
                       setSeasonNumber(null);
@@ -320,7 +734,13 @@ export const ManualMappingModal: React.FC<ManualMappingModalProps> = ({ item, on
                       loadDetails(r);
                     }}
                     className={`w-full flex items-center gap-3 p-3 rounded-2xl border transition ${
-                      selected?.tmdb_id === r.tmdb_id
+                      (selected?.provider === r.provider && (
+                        r.provider === 'jikan'
+                          ? selected?.mal_id === r.mal_id
+                          : r.provider === 'kitsu'
+                            ? selected?.kitsu_id === r.kitsu_id
+                            : selected?.tmdb_id === r.tmdb_id
+                      ))
                         ? 'border-indigo-500/50 bg-white/10 shadow-[0_0_20px_rgba(79,70,229,0.3)]'
                         : 'border-white/10 bg-white/5'
                     }`}
@@ -330,7 +750,7 @@ export const ManualMappingModal: React.FC<ManualMappingModalProps> = ({ item, on
                     </div>
                     <div className="text-left min-w-0">
                       <div className="text-white font-semibold truncate">{r.title}</div>
-                      <div className="text-xs text-slate-400">{r.media_type.toUpperCase()} · {r.year || '—'}</div>
+                      <div className="text-xs text-slate-400">{(r.media_type || 'tv').toUpperCase()} · {r.year || '—'}</div>
                     </div>
                   </button>
                 ))}
@@ -357,19 +777,99 @@ export const ManualMappingModal: React.FC<ManualMappingModalProps> = ({ item, on
                 onChange={(e) => {
                   const sn = Number(e.target.value);
                   setSeasonNumber(Number.isFinite(sn) ? sn : null);
-                  if (Number.isFinite(sn)) loadSeason(sn);
+                  if (Number.isFinite(sn)) {
+                    const match = sortedLocalSeasons.find((s) => s?.season_number === sn);
+                    if (match && Number.isFinite(Number(match.media_item_id)) && Number(match.media_item_id) > 0) {
+                      setApplyToSeasonIds([Number(match.media_item_id)]);
+                    }
+                    loadSeason(sn);
+                  }
                 }}
-                disabled={!selected || selected.media_type !== 'tv'}
+                disabled={!selected || selected.provider !== 'tmdb' || selected.media_type !== 'tv'}
               >
                 <option value="">{t('select_season')}</option>
                 {seasons.map((s) => (
                   <option key={s.season_number} value={s.season_number}>{`S${s.season_number} ${s.name || ''}`}</option>
                 ))}
               </select>
+              {provider === 'jikan' ? (
+                <div className="text-xs text-slate-500">{t('not_available_tmdb_only')}</div>
+              ) : null}
               {seasonLoading ? (
                 <div className="flex items-center gap-2 text-xs text-slate-400">
                   <Loader2 size={14} className="animate-spin" />
                   {t('loading_episodes_images')}
+                </div>
+              ) : null}
+
+              {provider === 'tmdb' && selected?.provider === 'tmdb' && selected?.media_type === 'tv' && (sortedLocalSeasons.length > 1 || localSeasonsLoading) ? (
+                <div className="mt-2 p-3 rounded-xl bg-white/5 border border-white/10">
+                  <div className="text-[11px] uppercase tracking-wider text-slate-400 mb-2">
+                    {t('manual_mapping_apply_to_local_seasons')}
+                  </div>
+                  <div className="text-xs text-slate-500 mb-2">
+                    {t('manual_mapping_apply_to_local_seasons_hint')}
+                  </div>
+                  {localSeasonsLoading ? (
+                    <div className="flex items-center gap-2 text-xs text-slate-400">
+                      <Loader2 size={14} className="animate-spin" />
+                      {t('loading')}
+                    </div>
+                  ) : (
+                    <div className="space-y-1 max-h-40 overflow-y-auto pr-1">
+                      {sortedLocalSeasons.map((s) => {
+                        const mid = Number(s.media_item_id);
+                        const checked = applyToSeasonIds.includes(mid);
+                        const sn = s.season_number;
+                        const label = typeof sn === 'number' ? `S${sn}` : `ID ${mid}`;
+                        return (
+                          <label key={mid} className="flex items-center gap-2 text-xs text-slate-300">
+                            <input
+                              type="checkbox"
+                              className="accent-indigo-500 w-4 h-4 rounded border-white/10 bg-black/30"
+                              checked={checked}
+                              disabled={busy}
+                              onChange={() => {
+                                setApplyToSeasonIds((prev) => {
+                                  const has = prev.includes(mid);
+                                  const next = has ? prev.filter((x) => x !== mid) : [...prev, mid];
+                                  return next.length ? next : prev; // keep at least one selected
+                                });
+                              }}
+                            />
+                            <span className="text-slate-400">{label}</span>
+                            <span className="truncate">{s.title_localized || s.title_en || ''}</span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  )}
+                  <div className="mt-2 flex justify-end gap-2">
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      disabled={busy}
+                      onClick={() => {
+                        const id = Number(item?.id);
+                        if (Number.isFinite(id) && id > 0) setApplyToSeasonIds([id]);
+                      }}
+                    >
+                      {t('manual_mapping_select_only_this_season')}
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      disabled={busy || !sortedLocalSeasons.length}
+                      onClick={() => setApplyToSeasonIds(sortedLocalSeasons.map((s) => Number(s.media_item_id)).filter((n) => Number.isFinite(n) && n > 0))}
+                    >
+                      {t('manual_mapping_select_all_seasons')}
+                    </Button>
+                  </div>
+                  {applyToSeasonIds.length > 1 ? (
+                    <div className="mt-2 text-xs text-slate-500">
+                      {t('manual_mapping_bulk_apply_note')}
+                    </div>
+                  ) : null}
                 </div>
               ) : null}
 
@@ -516,16 +1016,16 @@ export const ManualMappingModal: React.FC<ManualMappingModalProps> = ({ item, on
           ) : null}
         </div>
 
-        <div className="px-6 py-4 border-t border-white/10 flex justify-end gap-2">
-          <Button variant="ghost" onClick={onClose}>{t('close')}</Button>
-          <Button onClick={handleApply} disabled={busy || !selected}>
-            {t('save_changes')}
+        <div className="p-6 border-t border-white/10 flex justify-end gap-3 bg-slate-900/50">
+          <Button variant="ghost" onClick={onClose} disabled={busy}>{t('cancel')}</Button>
+          <Button onClick={handleApply} disabled={busy || !selected} icon={busy ? <Loader2 className="animate-spin" size={18} /> : <Save size={18} />}>
+            {busy ? t('saving') : t('apply_mapping')}
           </Button>
         </div>
       </div>
 
       {expandedImage ? (
-        <div className="fixed inset-0 z-[60] flex items-center justify-center p-6">
+        <div className="fixed inset-0 z-[280] flex items-center justify-center p-6">
           <div className="absolute inset-0 bg-black/80" onClick={() => setExpandedImage(null)} />
           <div className="relative max-w-4xl w-full">
             <img src={expandedImage} className="w-full max-h-[80vh] object-contain rounded-xl border border-white/10" />
@@ -540,4 +1040,6 @@ export const ManualMappingModal: React.FC<ManualMappingModalProps> = ({ item, on
       ) : null}
     </div>
   );
+
+  return content;
 };

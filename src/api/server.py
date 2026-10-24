@@ -6,45 +6,89 @@ import logging
 import threading
 from pathlib import Path
 
-from ..db import SessionLocal, init_db
-from ..db import models
-from ..core import config as core_config
-from ..core.config import DATA_DIR
-from ..services.enrichment_runner import start_enrichment_job
+try:
+    from ..db import SessionLocal, init_db
+    from ..db import models
+    from ..core import config as core_config
+    from ..core.config import DATA_DIR
+    from ..services.media_pipeline import start_enrichment_job
+except ImportError:  # pragma: no cover
+    from src.db import SessionLocal, init_db  # type: ignore
+    from src.db import models  # type: ignore
+    from src.core import config as core_config  # type: ignore
+    from src.core.config import DATA_DIR  # type: ignore
+    from src.services.media_pipeline import start_enrichment_job  # type: ignore
 import os
-from ..tools.apply_db_migrations import main as apply_db_migrations_main
+try:
+    from ..tools.apply_db_migrations import main as apply_db_migrations_main
+except ImportError:  # pragma: no cover
+    try:
+        from src.tools.apply_db_migrations import main as apply_db_migrations_main  # type: ignore
+    except Exception:
+        from tools.apply_db_migrations import main as apply_db_migrations_main  # type: ignore
 
 from . import runtime
 from .routers import app_config as app_config_router
 from .routers import admin as admin_router
 from .routers import credentials as credentials_router
 from .routers import enrich as enrich_router
-from .routers import localize as localize_router
 from .routers import system as system_router
 from .routers import roots as roots_router
 from .routers import scan as scan_router
 from .routers import fs as fs_router
 from .routers import media as media_router
 from .routers import manual_mapping as manual_mapping_router
+from .routers import localize as localize_router
+from .routers import anime_normalize as anime_normalize_router
 from .routers import user_list as user_list_router
 from .routers import stream as stream_router
-from .services import scan as scan_service
+from .routers import telemetry as telemetry_router
+from .routers import data_control as data_control_router
+from ..services import media_pipeline as scan_service
+from ..services import telemetry
 
 # scan state is stored in src.services.scan_state
 
 app = FastAPI(title='ArcaNea API')
+telemetry.install_logging_handler()
+
+
+def _ensure_dev_file_logging() -> None:
+    try:
+        log_root = Path(DATA_DIR).resolve().parent
+    except Exception:
+        log_root = Path.cwd().resolve()
+    log_dir = log_root / "logs"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return
+    log_path = log_dir / "arcanea.log"
+    try:
+        root_logger = logging.getLogger()
+        try:
+            if root_logger.level > logging.INFO:
+                root_logger.setLevel(logging.INFO)
+        except Exception:
+            pass
+        for h in list(root_logger.handlers):
+            try:
+                if isinstance(h, logging.FileHandler):
+                    if str(getattr(h, "baseFilename", "")) == str(log_path):
+                        return
+            except Exception:
+                continue
+        fh = logging.FileHandler(str(log_path), encoding="utf-8")
+        fh.setLevel(logging.INFO)
+        fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        fh.setFormatter(fmt)
+        root_logger.addHandler(fh)
+    except Exception:
+        pass
 
 origins = [
-    'http://localhost:5173',
-    'http://127.0.0.1:5173',
-    # Vite dev server (default for this repo)
-    'http://localhost:9587',
-    'http://127.0.0.1:9587',
-    # Back-compat (older dev setups)
-    'http://localhost:1587',
-    'http://127.0.0.1:1587',
-    'http://localhost:3000',
-    'http://127.0.0.1:3000',
+    'http://localhost:9800',
+    'http://127.0.0.1:9800',
 ]
 
 app.add_middleware(
@@ -59,15 +103,18 @@ app.include_router(app_config_router.router)
 app.include_router(admin_router.router)
 app.include_router(credentials_router.router)
 app.include_router(enrich_router.router)
-app.include_router(localize_router.router)
 app.include_router(system_router.router)
 app.include_router(roots_router.router)
 app.include_router(scan_router.router)
 app.include_router(fs_router.router)
 app.include_router(media_router.router)
 app.include_router(manual_mapping_router.router)
+app.include_router(localize_router.router)
+app.include_router(anime_normalize_router.router)
 app.include_router(user_list_router.router)
 app.include_router(stream_router.router)
+app.include_router(telemetry_router.router)
+app.include_router(data_control_router.router)
 
 # Serve locally cached media assets (posters/backdrops) under a non-conflicting path
 try:
@@ -80,14 +127,16 @@ except Exception:
 
 @app.on_event('startup')
 def on_startup():
+    _ensure_dev_file_logging()
     # Ensure DB schema matches current models before any SQLAlchemy queries run.
     # Without this, new columns (e.g. media_item.title_en) can cause OperationalError at runtime.
     try:
+        # First create base tables (fresh DB), then apply migrations/ALTERs.
+        init_db(models.Base)
         apply_db_migrations_main()
     except Exception:
         logging.getLogger(__name__).exception("DB migrations failed on startup; refusing to start.")
         raise
-    init_db(models.Base)
     # Cleanup: older runs could leave MediaItem.status='ENRICHED' even when only empty metadata rows exist.
     # Revert those to SCANNED so enrichment status is consistent.
     try:
@@ -137,6 +186,7 @@ def on_startup():
     db = SessionLocal()
     roots_count = 0
     already_scanned = False
+    any_root_unscanned = False
     try:
         existing = db.query(models.MediaRoot).count()
         if existing == 0:
@@ -177,6 +227,27 @@ def on_startup():
             already_scanned = bool((db.query(models.FileRecord).count() or 0) > 0)
         except Exception:
             already_scanned = False
+        try:
+            # If any configured root has no FileRecord rows, treat as not fully scanned.
+            roots = db.query(models.MediaRoot).all()
+            for r in roots:
+                try:
+                    rp = str(r.path)
+                except Exception:
+                    rp = None
+                if not rp:
+                    continue
+                try:
+                    base = str(rp).rstrip("\\/")
+                    like_prefix = f"{base}{os.sep}%"
+                    exists = db.query(models.FileRecord.id).filter(models.FileRecord.path.like(like_prefix)).first()
+                except Exception:
+                    exists = None
+                if not exists:
+                    any_root_unscanned = True
+                    break
+        except Exception:
+            any_root_unscanned = False
     finally:
         db.close()
 
@@ -191,7 +262,7 @@ def on_startup():
     if scan_mode in ('always',):
         startup_scan = True
     elif scan_mode in ('once', '1', 'true', 'yes'):
-        startup_scan = not already_scanned
+        startup_scan = (not already_scanned) or any_root_unscanned
 
     startup_enrich = False
     if enrich_mode in ('always', '1', 'true', 'yes'):
@@ -216,7 +287,7 @@ def on_startup():
             logging.getLogger(__name__).info('Startup scan disabled (ARCANEA_STARTUP_SCAN=%s)', scan_mode or '0')
 
     # Start enrichment runner at startup if there are pending items (optional; disabled by default).
-    if startup_enrich:
+    if startup_enrich and not startup_scan:
         try:
             start_enrichment_job()
         except Exception:
@@ -331,11 +402,9 @@ def _maybe_mount_frontend() -> None:
     Optional path: ARCANEA_FRONTEND_DIST=<abs path to dist>
     """
     try:
-        enabled = str(os.environ.get("ARCANEA_SERVE_FRONTEND", "0")).strip().lower() in ("1", "true", "yes")
+        env_val = os.environ.get("ARCANEA_SERVE_FRONTEND")
     except Exception:
-        enabled = False
-    if not enabled:
-        return
+        env_val = None
 
     try:
         dist_env = os.environ.get("ARCANEA_FRONTEND_DIST", "") or ""
@@ -348,10 +417,19 @@ def _maybe_mount_frontend() -> None:
 
     dist_dir = Path(dist_env).resolve() if dist_env else default_dist
     try:
-        if not dist_dir.is_dir():
-            logging.getLogger(__name__).warning("ARCANEA_SERVE_FRONTEND=1 but dist not found: %s", dist_dir)
-            return
+        dist_exists = dist_dir.is_dir()
     except Exception:
+        dist_exists = False
+
+    if env_val is None:
+        enabled = dist_exists
+    else:
+        enabled = str(env_val).strip().lower() in ("1", "true", "yes")
+
+    if not enabled:
+        return
+    if not dist_exists:
+        logging.getLogger(__name__).warning("ARCANEA_SERVE_FRONTEND enabled but dist not found: %s", dist_dir)
         return
 
     # Mount at the end so API routes match first.

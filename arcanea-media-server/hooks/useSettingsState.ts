@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Drive, MetadataConfig, ScanStatus, UserProfile, ViewState, AppStage } from '../types';
-import { MediaService, normalizeRoots, getStatusWsUrls } from '../services/api';
+import { MediaService, normalizeRoots, normalizeRootTypes, buildRootTypesPayload, getStatusWsUrls } from '../services/api';
 import { useI18n } from '../i18n/i18n';
 
 interface UseSettingsStateParams {
@@ -11,6 +11,8 @@ interface UseSettingsStateParams {
   setMetadataConfig: (cfg: MetadataConfig) => void;
   libraryPaths: string[];
   setLibraryPaths: (paths: string[]) => void;
+  looseMovieRoots: string[];
+  setLooseMovieRoots: (paths: string[]) => void;
   profiles: UserProfile[];
   showNotification: (type: 'success' | 'error' | 'info', message: string) => void;
   fetchMedia: (opts?: { reset?: boolean; userProfile?: UserProfile; silent?: boolean }) => Promise<void> | void;
@@ -26,6 +28,8 @@ export const useSettingsState = ({
   setMetadataConfig,
   libraryPaths,
   setLibraryPaths,
+  looseMovieRoots,
+  setLooseMovieRoots,
   profiles,
   showNotification,
   fetchMedia,
@@ -41,13 +45,15 @@ export const useSettingsState = ({
   const wsRef = useRef<WebSocket | null>(null);
   const [serverOffline, setServerOffline] = useState(false);
   const serverOfflineRef = useRef(false);
-  const prevScanRunningRef = useRef(false);
-  const prevEnrichRunningRef = useRef<boolean>(false);
   const processRunningRef = useRef(false);
   const [migrationRunning, setMigrationRunning] = useState<boolean>(false);
   const [migrationError, setMigrationError] = useState<string | null>(null);
   const lastWatchTsRef = useRef<number>(0);
   const watchRefreshTimerRef = useRef<number | null>(null);
+  const [rootTypes, setRootTypes] = useState<Record<string, string>>({});
+
+  // Telemetry SSE is handled inside SettingsView to avoid duplicate connections.
+
 
   const enrichmentRunning = useMemo(
     () => !!((enrichment as any)?.running || (enrichStats as any)?.running),
@@ -70,8 +76,9 @@ export const useSettingsState = ({
         // ignore
       }
 
-      const roots = await MediaService.getRoots();
-      setLibraryPaths(normalizeRoots(roots));
+      const rootsDetailed = await MediaService.getRootsDetailed();
+      setLibraryPaths(normalizeRoots(rootsDetailed));
+      setRootTypes(normalizeRootTypes(rootsDetailed));
     } catch (err) {
       console.error(err);
     } finally {
@@ -99,10 +106,10 @@ export const useSettingsState = ({
     }
   };
 
+
   const handleStartScan = async (pathsToScan = libraryPaths) => {
     if (scanStatus.scanning) {
-      setScanStatus({ scanning: false, progress: 0, currentFile: undefined });
-      showNotification('info', 'Escaneo cancelado');
+      showNotification('info', 'El escaneo ya está en ejecución');
       return;
     }
     setScanStatus({ scanning: true, progress: 0, currentFile: 'Inicializando...' });
@@ -133,57 +140,13 @@ export const useSettingsState = ({
         showNotification('info', 'El escaneo ya está en ejecución');
       }
       setMigrationRunning(false);
-
-      const poll = async () => {
-        try {
-          const status = await MediaService.getScanStatus();
-          const progressVal =
-            typeof status.progress === 'number'
-              ? status.progress
-              : status.total && status.processed
-                ? Math.round((status.processed / status.total) * 100)
-                : 0;
-          setScanStatus({
-            scanning: !!(status && status.scanning) || status.status !== 'idle',
-            progress: progressVal,
-            currentFile: (status.current || status.currentFile) as any,
-            processed: (status as any).processed,
-            total: (status as any).total,
-          } as any);
-          setEnrichment((status as any).enrichment || null);
-          try {
-            const es = await MediaService.getEnrichStatus();
-            setEnrichStats(es || null);
-            if (es) setEnrichment((prev) => ({ ...(prev || {}), ...(es || {}) }));
-          } catch {
-            // ignore
-          }
-
-          if (!status || status.status === 'idle' || !(status.scanning || status.status === 'scanning')) {
-            setScanStatus((prev) => ({ ...prev, scanning: false, progress: 100 } as any));
-            invalidateMediaCache();
-            setTimeout(() => fetchMedia({ reset: true, silent: true }), 800);
-            try {
-              const es = await MediaService.getEnrichStatus();
-              setEnrichStats(es || null);
-              if (es) setEnrichment((prev) => ({ ...(prev || {}), ...(es || {}) }));
-              if (!es || !es.running) {
-                await handleStartEnrich();
-              }
-            } catch {
-              // ignore
-            }
-            setMigrationRunning(false);
-          } else {
-            setTimeout(poll, 1000);
-          }
-        } catch (e) {
-          console.warn('Error polling scan status', e);
-          setTimeout(poll, 2000);
-        }
-      };
-
-      poll();
+      try {
+        const status = await MediaService.getScanStatus();
+        setScanStatus(status);
+        setEnrichment((status as any).enrichment || null);
+      } catch {
+        // ignore
+      }
     } catch (e) {
       console.error('Failed to start scan', e);
       setScanStatus({ scanning: false, progress: 0 });
@@ -191,18 +154,21 @@ export const useSettingsState = ({
     }
   };
 
-  const handleAddPath = (path: string) => {
+  const handleAddPath = (path: string, type?: string) => {
     (async () => {
       try {
-        const roots = await MediaService.addRoot(path);
+        const roots = await MediaService.addRoot(path, type);
         setLibraryPaths(normalizeRoots(roots));
+        setRootTypes(normalizeRootTypes(roots));
         showNotification('success', `Ruta agregada: ${path}`);
         try {
           await MediaService.saveAppConfig({
             setupComplete: true,
             profiles,
             metadata: metadataConfig,
-            media_roots: roots,
+            media_roots: normalizeRoots(roots),
+            loose_movie_roots: looseMovieRoots,
+            media_root_types: buildRootTypesPayload(normalizeRootTypes(roots)),
           });
         } catch (e) {
           console.warn('Failed to persist app-config after addRoot', e);
@@ -218,13 +184,20 @@ export const useSettingsState = ({
       try {
         const roots = await MediaService.removeRoot(path);
         setLibraryPaths(normalizeRoots(roots));
+        setRootTypes(normalizeRootTypes(roots));
+        const nextLoose = (looseMovieRoots || []).filter((p) => p !== path);
+        if (nextLoose.length !== (looseMovieRoots || []).length) {
+          setLooseMovieRoots(nextLoose);
+        }
         showNotification('info', 'Ruta eliminada');
         try {
           await MediaService.saveAppConfig({
             setupComplete: true,
             profiles,
             metadata: metadataConfig,
-            media_roots: roots,
+            media_roots: normalizeRoots(roots),
+            loose_movie_roots: nextLoose.length ? nextLoose : looseMovieRoots,
+            media_root_types: buildRootTypesPayload(normalizeRootTypes(roots)),
           });
         } catch (e) {
           console.warn('Failed to persist app-config after removeRoot', e);
@@ -245,9 +218,60 @@ export const useSettingsState = ({
           profiles,
           metadata: config,
           media_roots: libraryPaths,
+          loose_movie_roots: looseMovieRoots,
+          media_root_types: buildRootTypesPayload(rootTypes),
         });
       } catch (e) {
         console.warn('Failed to persist metadata config', e);
+      }
+    })();
+  };
+
+  const handleSetRootType = (path: string, type: string) => {
+    (async () => {
+      try {
+        const roots = await MediaService.updateRootType(path, type);
+        setLibraryPaths(normalizeRoots(roots));
+        const nextTypes = normalizeRootTypes(roots);
+        setRootTypes(nextTypes);
+        showNotification('success', t('saved'));
+        try {
+          await MediaService.saveAppConfig({
+            setupComplete: true,
+            profiles,
+            metadata: metadataConfig,
+            media_roots: normalizeRoots(roots),
+            loose_movie_roots: looseMovieRoots,
+            media_root_types: buildRootTypesPayload(nextTypes),
+          });
+        } catch (e) {
+          console.warn('Failed to persist app-config after updateRootType', e);
+        }
+      } catch (e) {
+        showNotification('error', String(e));
+      }
+    })();
+  };
+
+  const handleToggleLooseMovieRoot = (path: string) => {
+    const target = String(path || '').trim();
+    if (!target) return;
+    const current = looseMovieRoots || [];
+    const exists = current.includes(target);
+    const next = exists ? current.filter((p) => p !== target) : [...current, target];
+    setLooseMovieRoots(next);
+    (async () => {
+      try {
+        await MediaService.saveAppConfig({
+          setupComplete: true,
+          profiles,
+          metadata: metadataConfig,
+          media_roots: libraryPaths,
+          loose_movie_roots: next,
+          media_root_types: buildRootTypesPayload(rootTypes),
+        });
+      } catch (e) {
+        console.warn('Failed to persist loose movie roots', e);
       }
     })();
   };
@@ -273,24 +297,25 @@ export const useSettingsState = ({
         const total = Number.isFinite(scan.total) ? Number(scan.total) : undefined;
         const processed = Number.isFinite(scan.processed) ? Number(scan.processed) : undefined;
         const status = typeof scan.status === 'string' ? scan.status : undefined;
+        const phase = typeof scan.phase === 'string' ? scan.phase : undefined;
         const scanning = !!(scan.scanning || status === 'scanning' || status === 'queued');
-        const progress =
-          typeof scan.progress === 'number'
-            ? scan.progress
-            : total && processed
-              ? Math.round((processed / total) * 100)
-              : scanning
-                ? 0
-                : 0;
+        const progress = 0;
         const currentFile = (scan.current || scan.currentFile || scan.current_path || scan.current_item) as any;
+        const queued = typeof scan.queued === 'number' ? scan.queued : undefined;
+        const rootCounts = scan.root_counts && typeof scan.root_counts === 'object' ? scan.root_counts : undefined;
+        const watch = scan.watch && typeof scan.watch === 'object' ? scan.watch : undefined;
         setScanStatus((prev) => ({
           ...prev,
           scanning,
           progress,
           total,
           processed,
+          queued,
           currentFile: typeof currentFile === 'string' ? currentFile : prev.currentFile,
           status,
+          phase,
+          root_counts: rootCounts ?? prev.root_counts,
+          watch: watch ?? prev.watch,
         }));
       }
 
@@ -415,18 +440,6 @@ export const useSettingsState = ({
     };
   }, []);
 
-  // Refresh grid once when scan transitions to idle.
-  useEffect(() => {
-    const running = !!scanStatus.scanning;
-    const wasRunning = !!prevScanRunningRef.current;
-    prevScanRunningRef.current = running;
-    if (wasRunning && !running && appStage === 'app' && !serverOfflineRef.current) {
-      invalidateMediaCache();
-      void fetchMedia({ reset: true, silent: true });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scanStatus.scanning]);
-
   // Notify once when scan + enrichment finishes.
   useEffect(() => {
     if (appStage !== 'app') return;
@@ -446,72 +459,57 @@ export const useSettingsState = ({
   useEffect(() => {
     if (appStage !== 'app') return;
 
-    const shouldPoll = !wsConnected && (currentView === 'settings' || scanStatus.scanning || enrichmentRunning);
+    const shouldPoll = !wsConnected && (currentView === 'settings' || scanStatus.scanning || enrichmentRunning || migrationRunning);
     if (!shouldPoll) return;
 
     let cancelled = false;
+    const intervalMs = scanStatus.scanning || enrichmentRunning || migrationRunning ? 4000 : 10000;
     const tick = async () => {
       try {
+        const status = await MediaService.getScanStatus();
+        if (cancelled) return;
+        setScanStatus(status);
+        setEnrichment((prev) => ({ ...(prev || {}), ...((status as any).enrichment || {}) }));
         const es = await MediaService.getEnrichStatus();
         if (cancelled) return;
         setEnrichStats(es || null);
         if (es) setEnrichment((prev) => ({ ...(prev || {}), ...(es || {}) }));
 
-        const runningNow = !!(es && es.running);
-        prevEnrichRunningRef.current = runningNow;
       } catch {
         // ignore
       }
     };
 
     void tick();
-    const id = window.setInterval(() => void tick(), 5000);
+    const id = window.setInterval(() => void tick(), intervalMs);
 
     return () => {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [appStage, currentView, scanStatus.scanning, enrichmentRunning, wsConnected]);
+  }, [appStage, currentView, scanStatus.scanning, enrichmentRunning, migrationRunning, wsConnected]);
 
   // Watcher notifications (new/changed media files) for manager profile only.
   useEffect(() => {
     if (appStage !== 'app') return;
     if (!currentUser) return;
     if (!currentUser.isManager) return;
-
-    let cancelled = false;
-    const tick = async () => {
-      try {
-        const st: any = await MediaService.getScanStatus();
-        if (cancelled) return;
-        const w = st && (st as any).watch;
-        const ts = w && typeof w.ts === 'number' ? Number(w.ts) : 0;
-        const p = w && w.path ? String(w.path) : '';
-        if (ts && ts > (lastWatchTsRef.current || 0) && p) {
-          lastWatchTsRef.current = ts;
-          try {
-            if (watchRefreshTimerRef.current) window.clearTimeout(watchRefreshTimerRef.current);
-            watchRefreshTimerRef.current = window.setTimeout(() => {
-              invalidateMediaCache();
-              void fetchMedia({ reset: true, userProfile: currentUser, silent: true });
-            }, 1200);
-          } catch {
-            // ignore
-          }
-        }
-      } catch {
-        // ignore
-      }
-    };
-
-    void tick();
-    const id = window.setInterval(() => void tick(), 5000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(id);
-    };
+    const w = (scanStatus as any)?.watch;
+    const ts = w && typeof w.ts === 'number' ? Number(w.ts) : 0;
+    const p = w && w.path ? String(w.path) : '';
+    if (!ts || !p || ts <= (lastWatchTsRef.current || 0)) return;
+    lastWatchTsRef.current = ts;
+    try {
+      if (watchRefreshTimerRef.current) window.clearTimeout(watchRefreshTimerRef.current);
+      watchRefreshTimerRef.current = window.setTimeout(() => {
+        invalidateMediaCache();
+        void fetchMedia({ reset: true, userProfile: currentUser, silent: true });
+      }, 1200);
+    } catch {
+      // ignore
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [appStage, currentUser?.id]);
+  }, [appStage, currentUser?.id, (scanStatus as any)?.watch?.ts]);
 
   return {
     drives,
@@ -528,5 +526,8 @@ export const useSettingsState = ({
     handleAddPath,
     handleRemovePath,
     handleUpdateMetadataConfig,
+    handleToggleLooseMovieRoot,
+    rootTypes,
+    handleSetRootType,
   };
 };

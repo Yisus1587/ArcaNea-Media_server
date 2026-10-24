@@ -1,16 +1,28 @@
 __pycache__/
 *.py[cod]
+.venv/
+venv/
 
 node_modules/
 .vite/
 .vite-temp/
 
 data/
+logs/
 .env
 .env.*
 
 dist/
 build/
+
+# Certificados TLS locales (generados por `python run.py --https` / mkcert)
+certs/
+*.pem
+
+# Copias de respaldo, cachés y artefactos que no se versionan
+src.zip
+.cache/
+incoming/
 
 .DS_Store
 Thumbs.db
