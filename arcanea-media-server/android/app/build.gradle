@@ -8,10 +8,10 @@ apply plugin: 'com.chaquo.python'
 // asi que se copia tal cual dentro de src/main/python para que el paquete conserve
 // su nombre. La copia se regenera en cada build y no se versiona.
 // ---------------------------------------------------------------------------
-def backendSrcDir = file("../../src")
+def backendSrcDir = file("../../../src")
 def backendPythonDir = file("src/main/python/src")
 
-tasks.register("syncBackendPython", type: Copy) {
+tasks.register("syncBackendPython", Copy) {
     outputs.upToDateWhen { false }
     doFirst {
         // Stale modules from a removed package must not survive in the APK.
@@ -22,6 +22,12 @@ tasks.register("syncBackendPython", type: Copy) {
         exclude "**/__pycache__/**"
     }
     into backendPythonDir
+}
+
+// Chaquopy's merge tasks read src/main/python, which syncBackendPython fills.
+// Without this the two run in an arbitrary order (Gradle fails the build for it).
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("PythonSources") }.configureEach {
+    dependsOn("syncBackendPython")
 }
 
 // preBuild runs first in every variant; anything Chaquopy merges afterwards sees the copy.
@@ -91,7 +97,8 @@ chaquopy {
             // wheels (cp312, arm64/x86_64) come from this index. See
             // requirements-android.txt for the pinned versions it forces.
             options "--extra-index-url", "https://pypi.flet.dev"
-            install "-r", file("../../requirements-android.txt")
+            // install() is `String...`, so pass the path, not a File object.
+            install "-r", file("../../../requirements-android.txt").absolutePath
         }
     }
 }
