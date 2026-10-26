@@ -12,6 +12,7 @@ import { normalizeServerOrigin, setServerOrigin } from './api';
  */
 
 const STORAGE_KEY = 'arcanea_server_url';
+const MODE_KEY = 'arcanea_server_mode';
 // The API keeps its admin token in localStorage, which index.tsx clears on every
 // load; on native the token survives in Preferences and is restored at boot.
 const TOKEN_KEY = 'arcanea_admin_token';
@@ -121,6 +122,27 @@ export async function forgetServerUrl(): Promise<void> {
   }
 }
 
+export type ServerMode = 'local' | 'remote';
+
+export async function readServerMode(): Promise<ServerMode | null> {
+  if (!isNativeApp()) return null;
+  try {
+    const { value } = await Preferences.get({ key: MODE_KEY });
+    return value === 'local' || value === 'remote' ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function persistServerMode(mode: ServerMode): Promise<void> {
+  if (!isNativeApp()) return;
+  try {
+    await Preferences.set({ key: MODE_KEY, value: mode });
+  } catch {
+    // ignore
+  }
+}
+
 export type ServerCheck = {
   ok: boolean;
   detail: 'ok' | 'degraded' | 'invalid' | 'timeout' | 'unreachable' | 'http_error';
@@ -153,12 +175,26 @@ export async function checkServer(raw: string, timeoutMs: number = 6000): Promis
  * Apply the stored server (if any). `needsSetup` is true on a native build with no
  * address yet; on the web it is always false so the app boots exactly as before.
  */
-export async function initServerConfig(): Promise<{ needsSetup: boolean; origin: string | null }> {
-  if (!isNativeApp()) return { needsSetup: false, origin: null };
+export async function initServerConfig(): Promise<{ needsSetup: boolean; origin: string | null; mode: ServerMode | null }> {
+  if (!isNativeApp()) return { needsSetup: false, origin: null, mode: null };
+
+  const mode = await readServerMode();
   const stored = await readStoredServerUrl();
+
+  if (mode === 'local' && stored) {
+    // The embedded server dies with the app, so it has to be started again.
+    const { startLocalServer } = await import('./localServer');
+    const origin = await startLocalServer(Number(new URL(stored).port || 9800));
+    if (origin) {
+      setServerOrigin(origin);
+      return { needsSetup: false, origin, mode };
+    }
+    return { needsSetup: true, origin: stored, mode };
+  }
+
   if (stored) {
     setServerOrigin(stored);
     await restoreAdminToken();
   }
-  return { needsSetup: !stored, origin: stored };
+  return { needsSetup: !stored, origin: stored, mode };
 }

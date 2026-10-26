@@ -15,24 +15,32 @@
 # proto-plus, protobuf, oauthlib, uritemplate...) los resuelve pip, igual que en
 # requirements.txt.
 #
-# Riesgo conocido para Fase 4: cryptography, cffi, pydantic_core y greenlet son
-# extensiones nativas y necesitan estar disponibles como wheel en Chaquopy.
+# Versiones ajustadas a los wheels Android de Chaquopy (solo arm64/x86_64, CPython 3.12).
+# Chaquopy 17 ya no compila desde fuente (usa --only-binary), asi que cada paquete
+# nativo necesita un wheel disponible:
+#   cryptography 42.0.8  -> wheel oficial de Chaquopy
+#   cffi 1.17.1          -> wheel oficial de Chaquopy
+#   greenlet 3.0.1       -> wheel oficial de Chaquopy
+#   pydantic-core        -> NO existe en el repositorio de Chaquopy. Los wheels
+#                           android cp312 vienen del indice de Flet, y solo hay
+#                           pydantic-core 2.33.2 (entre otras), que obliga a
+#                           pydantic 2.11.x. FastAPI 0.128 acepta pydantic>=2.7.
 
 annotated-doc==0.0.4
 annotated-types==0.7.0
 anyio==4.12.1
 certifi==2026.1.4
-cffi==2.0.0
+cffi==1.17.1
 charset-normalizer==3.4.4
 click==8.3.1
 colorama==0.4.6
-cryptography==46.0.5
+cryptography==42.0.8
 distro==1.9.0
 fastapi==0.128.0
 google-auth==2.48.0
 google-auth-oauthlib==1.2.1
 google-api-python-client==2.154.0
-greenlet==3.3.1
+greenlet==3.0.1
 h11==0.16.0
 idna==3.11
 markdown-it-py==4.0.0
@@ -41,8 +49,8 @@ packaging==26.0
 pyasn1==0.6.2
 pyasn1_modules==0.4.2
 pycparser==3.0
-pydantic==2.12.5
-pydantic_core==2.41.5
+pydantic==2.11.9
+pydantic_core==2.33.2
 Pygments==2.19.2
 python-dotenv==1.2.1
 PyYAML==6.0.3

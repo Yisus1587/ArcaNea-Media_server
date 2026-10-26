@@ -1,4 +1,35 @@
 apply plugin: 'com.android.application'
+apply plugin: 'com.chaquo.python'
+
+// ---------------------------------------------------------------------------
+// Backend Python embebido (Chaquopy)
+//
+// El backend vive en <repo>/src y se importa como `src.*` (usa imports relativos),
+// asi que se copia tal cual dentro de src/main/python para que el paquete conserve
+// su nombre. La copia se regenera en cada build y no se versiona.
+// ---------------------------------------------------------------------------
+def backendSrcDir = file("../../src")
+def backendPythonDir = file("src/main/python/src")
+
+tasks.register("syncBackendPython", type: Copy) {
+    outputs.upToDateWhen { false }
+    doFirst {
+        // Stale modules from a removed package must not survive in the APK.
+        delete(backendPythonDir)
+    }
+    from(backendSrcDir) {
+        include "**/*.py"
+        exclude "**/__pycache__/**"
+    }
+    into backendPythonDir
+}
+
+// preBuild runs first in every variant; anything Chaquopy merges afterwards sees the copy.
+tasks.configureEach { task ->
+    if (task.name == "preBuild") {
+        task.dependsOn("syncBackendPython")
+    }
+}
 
 android {
     namespace = "com.arcanea.media"
@@ -10,6 +41,11 @@ android {
         versionCode 1
         versionName "1.0"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        ndk {
+            // Chaquopy needs explicit ABIs: phones/tablets and the x86_64 emulator.
+            // Python 3.12+ is 64-bit only, so no armeabi-v7a.
+            abiFilters "arm64-v8a", "x86_64"
+        }
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
              // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf72b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
@@ -40,6 +76,20 @@ dependencies {
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
     implementation project(':capacitor-cordova-android-plugins')
+}
+
+chaquopy {
+    defaultConfig {
+        // Wheels exist for 3.10-3.13; the backend needs 3.10+ syntax and 64-bit Python.
+        version = "3.12"
+        pip {
+            // pydantic-core has no wheel in Chaquopy's own repository, so its Android
+            // wheels (cp312, arm64/x86_64) come from this index. See
+            // requirements-android.txt for the pinned versions it forces.
+            options "--extra-index-url", "https://pypi.flet.dev"
+            install "-r", file("../../requirements-android.txt")
+        }
+    }
 }
 
 apply from: 'capacitor.build.gradle'

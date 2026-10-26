@@ -55,6 +55,9 @@ captures/
 # Web build copied by `npx cap sync` (regenerate it, do not commit it)
 app/src/main/assets/public/
 
+# Backend Python copied by the syncBackendPython Gradle task
+app/src/main/python/src/
+
 # Keystore files
 *.jks
 *.keystore

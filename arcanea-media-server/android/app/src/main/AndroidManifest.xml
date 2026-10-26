@@ -26,6 +26,13 @@
 
         </activity>
 
+        <!-- Servidor local embebido: Android mata los hilos en segundo plano, asi que
+             uvicorn corre dentro de un servicio en primer plano con notificacion. -->
+        <service
+            android:name=".LocalServerService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
@@ -43,4 +50,17 @@
     <!-- Escaneo del QR de conexion (modo cliente). -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
+
+    <!-- Modo servidor local: uvicorn en un servicio en primer plano. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Acceso a la biblioteca de medios del telefono. MANAGE_EXTERNAL_STORAGE
+         no lo concede el sistema por dialogo: se pide en Ajustes (instalacion manual). -->
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 </manifest>
