@@ -643,70 +643,9 @@ class Scanner:
         session.add(fr)
 
     def _sync_series_tree(self, session, mi: MediaItem, ctx: dict[str, object], files: list[FileRecord]) -> None:
-        series_key = str(ctx.get("series_key") or "")
-        if not series_key:
-            return
-        series = session.query(Series).filter(Series.provider_id == series_key).first()
-        if series is None:
-            series = Series(
-                title=str(ctx["base_title"]),
-                title_en=str(ctx["base_title"]),
-                provider_id=series_key,
-            )
-            session.add(series)
-            session.flush()
-        season_number = int(ctx.get("season_number") if ctx.get("season_number") is not None else 1)
-        si = session.query(SeasonItem).filter(SeasonItem.media_item_id == mi.id).first()
-        season = session.query(Season).filter(Season.id == si.season_id).first() if si else None
-        if season is None:
-            season = (
-                session.query(Season)
-                .filter(Season.series_id == series.id, Season.season_number == season_number)
-                .first()
-            )
-            if season is not None:
-                taken = session.query(SeasonItem.id).filter(SeasonItem.season_id == season.id).first()
-                if taken:
-                    season = None
-        if season is None:
-            season = Season(series_id=series.id, season_number=season_number)
-            session.add(season)
-            session.flush()
-        else:
-            season.series_id = series.id
-            season.season_number = season_number
-            session.add(season)
-        if si is None:
-            si = SeasonItem(season_id=season.id, media_item_id=mi.id, media_id=mi.media_id)
-        else:
-            si.season_id = season.id
-            si.media_id = mi.media_id
-        session.add(si)
-        session.flush()
-
-        for fr in files:
-            ep_num = int(fr.file_index or 0)
-            ep = (
-                session.query(Episode)
-                .filter(Episode.season_id == season.id, Episode.episode_number == ep_num)
-                .first()
-            )
-            if ep is None:
-                ep = Episode(
-                    season_id=season.id,
-                    episode_number=ep_num,
-                    title=f"Episodio {ep_num}",
-                    title_en=f"Episode {ep_num}",
-                    title_localized=f"Episodio {ep_num}",
-                )
-                session.add(ep)
-                session.flush()
-            ef = session.query(EpisodeFile).filter(EpisodeFile.file_record_id == fr.id).first()
-            if ef is None:
-                ef = EpisodeFile(episode_id=ep.id, file_record_id=fr.id)
-            else:
-                ef.episode_id = ep.id
-            session.add(ef)
+        # Kept as a method for the scanner's own call sites; the implementation is
+        # shared with the Google Drive scanner, which has no filesystem to walk.
+        sync_series_tree(session, mi, ctx, files)
 
     def normalize_pending_items(self, limit: int | None = None) -> int:
         return 0
@@ -714,6 +653,78 @@ class Scanner:
     def scan_roots_sequential(self, roots: Iterable[str] | None = None, *, start_enrichment_after_scan: bool = False):
         for root in roots or [str(r) for r in self.roots]:
             self.scan_path(str(root))
+
+
+def sync_series_tree(session, mi: MediaItem, ctx: dict[str, object], files: list[FileRecord]) -> None:
+    """Create/link Series -> Season -> Episode rows for a media item.
+
+    Shared by the local and the Google Drive scanners: it only touches ORM objects
+    and the `ctx` mapping, so it works the same for remote files.
+    """
+    series_key = str(ctx.get("series_key") or "")
+    if not series_key:
+        return
+    series = session.query(Series).filter(Series.provider_id == series_key).first()
+    if series is None:
+        series = Series(
+            title=str(ctx["base_title"]),
+            title_en=str(ctx["base_title"]),
+            provider_id=series_key,
+        )
+        session.add(series)
+        session.flush()
+    season_number = int(ctx.get("season_number") if ctx.get("season_number") is not None else 1)
+    si = session.query(SeasonItem).filter(SeasonItem.media_item_id == mi.id).first()
+    season = session.query(Season).filter(Season.id == si.season_id).first() if si else None
+    if season is None:
+        season = (
+            session.query(Season)
+            .filter(Season.series_id == series.id, Season.season_number == season_number)
+            .first()
+        )
+        if season is not None:
+            taken = session.query(SeasonItem.id).filter(SeasonItem.season_id == season.id).first()
+            if taken:
+                season = None
+    if season is None:
+        season = Season(series_id=series.id, season_number=season_number)
+        session.add(season)
+        session.flush()
+    else:
+        season.series_id = series.id
+        season.season_number = season_number
+        session.add(season)
+    if si is None:
+        si = SeasonItem(season_id=season.id, media_item_id=mi.id, media_id=mi.media_id)
+    else:
+        si.season_id = season.id
+        si.media_id = mi.media_id
+    session.add(si)
+    session.flush()
+
+    for fr in files:
+        ep_num = int(fr.file_index or 0)
+        ep = (
+            session.query(Episode)
+            .filter(Episode.season_id == season.id, Episode.episode_number == ep_num)
+            .first()
+        )
+        if ep is None:
+            ep = Episode(
+                season_id=season.id,
+                episode_number=ep_num,
+                title=f"Episodio {ep_num}",
+                title_en=f"Episode {ep_num}",
+                title_localized=f"Episodio {ep_num}",
+            )
+            session.add(ep)
+            session.flush()
+        ef = session.query(EpisodeFile).filter(EpisodeFile.file_record_id == fr.id).first()
+        if ef is None:
+            ef = EpisodeFile(episode_id=ep.id, file_record_id=fr.id)
+        else:
+            ef.episode_id = ep.id
+        session.add(ef)
 
 
 def _series_slug(title: str) -> str:

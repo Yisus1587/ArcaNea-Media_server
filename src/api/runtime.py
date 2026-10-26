@@ -56,7 +56,17 @@ def watcher_set_roots(paths: Iterable[str]) -> None:
 def watcher_set_roots_from_db(db: Session) -> None:
     try:
         items = db.query(models.MediaRoot).all()
-        watcher_set_roots([str(i.path) for i in items if getattr(i, "path", None)])
+        # Remote roots (gdrive://...) have no filesystem to watch; local polling
+        # handles them through the scan pipeline instead.
+        watcher_set_roots(
+            [
+                str(i.path)
+                for i in items
+                if getattr(i, "path", None)
+                and not str(i.path).startswith("gdrive://")
+                and getattr(i, "kind", "local") != "gdrive"
+            ]
+        )
     except Exception:
         logging.getLogger(__name__).exception("watcher_set_roots_from_db failed")
 

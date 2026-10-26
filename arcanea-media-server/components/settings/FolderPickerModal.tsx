@@ -1,11 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { X, Folder, HardDrive, ChevronLeft, CheckSquare, Square, Loader2, RefreshCw } from 'lucide-react';
+import { X, Folder, HardDrive, Cloud, ChevronLeft, CheckSquare, Square, Loader2, RefreshCw } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { MediaService } from '../../services/api';
 import { useI18n } from '../../i18n/i18n';
 
 type Entry = { name: string; path: string; type: string };
+type Source = 'local' | 'drive';
 
 function _labelFor(entry: Entry): string {
   return entry.name || entry.path || '-';
@@ -39,12 +40,15 @@ export function FolderPickerModal(props: {
 }) {
   const { open, onClose, onConfirm, title } = props;
   const { t } = useI18n();
+  const [source, setSource] = useState<Source>('local');
   const [currentPath, setCurrentPath] = useState<string | null>(null);
   const [parent, setParent] = useState<string | null>(null);
   const [entries, setEntries] = useState<Entry[]>([]);
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [driveReady, setDriveReady] = useState(false);
+  const [driveStack, setDriveStack] = useState<Array<{ id: string; name: string }>>([{ id: 'root', name: 'Google Drive' }]);
   const mountedRef = useRef(false);
   const openRef = useRef(open);
   const requestSeqRef = useRef(0);
@@ -85,10 +89,84 @@ export function FolderPickerModal(props: {
     }
   }, []);
 
+  const loadDrive = useCallback(async (parentId: string) => {
+    const reqId = ++requestSeqRef.current;
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await MediaService.listGDriveFolders(parentId);
+      if (!mountedRef.current || !openRef.current || reqId !== requestSeqRef.current) return;
+      const folders = Array.isArray(res?.folders) ? res.folders : [];
+      setEntries(
+        folders
+          .filter((f: any) => f && f.id)
+          .map((f: any) => ({ name: String(f.name || f.id), path: `gdrive://${f.id}`, type: 'drive' })),
+      );
+    } catch (e) {
+      if (!mountedRef.current || !openRef.current || reqId !== requestSeqRef.current) return;
+      setError(String(e));
+      setEntries([]);
+    } finally {
+      if (mountedRef.current && openRef.current && reqId === requestSeqRef.current) {
+        setLoading(false);
+      }
+    }
+  }, []);
+
   useEffect(() => {
     if (!open) return;
+    setSource('local');
+    setSelected({});
+    setDriveStack([{ id: 'root', name: 'Google Drive' }]);
     void load(null);
+    let cancelled = false;
+    void MediaService.getGDriveStatus()
+      .then((res) => {
+        if (!cancelled && mountedRef.current) setDriveReady(!!res?.authenticated);
+      })
+      .catch(() => {
+        if (!cancelled && mountedRef.current) setDriveReady(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [open, load]);
+
+  const switchSource = (next: Source) => {
+    if (next === source) return;
+    setSelected({});
+    setSource(next);
+    if (next === 'drive') {
+      setDriveStack([{ id: 'root', name: 'Google Drive' }]);
+      void loadDrive('root');
+    } else {
+      void load(null);
+    }
+  };
+
+  const goBack = () => {
+    if (source === 'drive') {
+      if (driveStack.length <= 1) return;
+      const next = driveStack.slice(0, -1);
+      setDriveStack(next);
+      void loadDrive(next[next.length - 1].id);
+      return;
+    }
+    void load(parent);
+  };
+
+  const openEntry = (entry: Entry) => {
+    if (source === 'drive') {
+      const id = entry.path.replace('gdrive://', '');
+      setDriveStack((prev) => [...prev, { id, name: entry.name }]);
+      void loadDrive(id);
+      return;
+    }
+    void load(entry.path);
+  };
+
+  const currentLocation =
+    source === 'drive' ? driveStack.map((s) => s.name).join(' / ') : currentPath || t('drives');
 
   if (!open) return null;
   if (typeof document === 'undefined') return null;
@@ -99,8 +177,8 @@ export function FolderPickerModal(props: {
         <div className="flex items-center justify-between px-5 py-4 border-b border-white/10">
           <div className="min-w-0">
             <div className="text-white font-semibold">{title || t('select_folders_title')}</div>
-            <div className="mt-1 text-xs text-slate-400 font-mono truncate" title={currentPath || t('drives')}>
-              {currentPath || t('drives')}
+            <div className="mt-1 text-xs text-slate-400 font-mono truncate" title={currentLocation}>
+              {currentLocation}
             </div>
           </div>
           <button
@@ -113,13 +191,38 @@ export function FolderPickerModal(props: {
           </button>
         </div>
 
-        <div className="px-5 py-3 flex items-center gap-2">
+        <div className="px-5 py-3 flex items-center gap-2 flex-wrap">
+          <div className="flex items-center rounded-lg border border-white/10 overflow-hidden">
+            <button
+              type="button"
+              onClick={() => switchSource('local')}
+              className={`px-3 py-1.5 text-xs flex items-center gap-1.5 transition ${
+                source === 'local' ? 'bg-white/10 text-white' : 'text-slate-400 hover:text-white'
+              }`}
+              title={t('source_this_device')}
+            >
+              <HardDrive size={13} />
+              {t('source_this_device')}
+            </button>
+            <button
+              type="button"
+              onClick={() => switchSource('drive')}
+              disabled={!driveReady}
+              className={`px-3 py-1.5 text-xs flex items-center gap-1.5 border-l border-white/10 transition ${
+                source === 'drive' ? 'bg-white/10 text-white' : 'text-slate-400 hover:text-white'
+              } ${driveReady ? '' : 'opacity-40 cursor-not-allowed'}`}
+              title={driveReady ? 'Google Drive' : t('drive_not_connected')}
+            >
+              <Cloud size={13} />
+              Google Drive
+            </button>
+          </div>
           <Button
             type="button"
             size="sm"
             variant="ghost"
-            onClick={() => void load(parent)}
-            disabled={!parent || loading}
+            onClick={goBack}
+            disabled={source === 'drive' ? driveStack.length <= 1 || loading : !parent || loading}
             icon={<ChevronLeft size={14} />}
           >
             {t('back')}
@@ -128,7 +231,7 @@ export function FolderPickerModal(props: {
             type="button"
             size="sm"
             variant="ghost"
-            onClick={() => void load(currentPath)}
+            onClick={() => (source === 'drive' ? void loadDrive(driveStack[driveStack.length - 1].id) : void load(currentPath))}
             disabled={loading}
             icon={<RefreshCw size={14} />}
           >
@@ -151,14 +254,14 @@ export function FolderPickerModal(props: {
             </div>
           ) : entries.length === 0 ? (
             <div className="px-4 py-10 text-center text-sm text-slate-400">
-              {t('no_subfolders')}
+              {source === 'drive' && !driveReady ? t('drive_not_connected') : t('no_subfolders')}
             </div>
           ) : (
             <div className="space-y-1">
               {entries.map((e, idx) => {
                 const key = e.path;
                 const isSelected = !!selected[key];
-                const isDrive = (e.type || '').toLowerCase() === 'drive';
+                const isRemote = (e.type || '').toLowerCase() === 'drive';
                 return (
                   <div
                     key={`${key}::${idx}`}
@@ -176,12 +279,12 @@ export function FolderPickerModal(props: {
 
                     <button
                       type="button"
-                      onClick={() => void load(e.path)}
+                      onClick={() => openEntry(e)}
                       className="flex-1 min-w-0 flex items-center gap-3 text-left"
                       title={t('open')}
                     >
                       <div className="w-9 h-9 rounded-lg bg-slate-800/60 border border-white/5 flex items-center justify-center text-indigo-200">
-                        {isDrive ? <HardDrive size={18} /> : <Folder size={18} />}
+                        {isRemote ? <Cloud size={18} /> : <Folder size={18} />}
                       </div>
                       <div className="min-w-0">
                         <div className="text-sm text-white font-medium truncate">{_labelFor(e)}</div>

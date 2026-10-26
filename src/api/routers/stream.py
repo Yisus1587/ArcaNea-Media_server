@@ -59,6 +59,37 @@ def _is_known_media_file(path: str) -> bool:
         db.close()
 
 
+def _parse_range_header(range_header: str | None, file_size: int) -> tuple[int, int] | None:
+    """Parse a single `bytes=start-end` range, clamped to the file size."""
+    if not range_header or file_size <= 0:
+        return None
+    try:
+        units, rng = range_header.split("=", 1)
+        if units.strip() != "bytes":
+            return None
+        rstart, rend = rng.split("-", 1)
+        start = int(rstart) if rstart.strip() else 0
+        end = int(rend) if rend.strip() else file_size - 1
+        if start < 0 or start > end or start >= file_size:
+            return None
+        return start, min(end, file_size - 1)
+    except Exception:
+        return None
+
+
+def _iter_upstream(resp, chunk_size: int = 1024 * 1024):
+    """Yield bytes from a streaming HTTP response and always release it."""
+    try:
+        for chunk in resp.iter_content(chunk_size=chunk_size):
+            if chunk:
+                yield chunk
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+
+
 @router.get("/api/stream")
 def stream_file(path: str, request: Request):
     """Stream a local file with support for Range requests."""
@@ -72,29 +103,41 @@ def stream_file(path: str, request: Request):
         file_id = str(path).replace('gdrive://', '').strip()
         try:
             file_info = gdrive_service.get_file(file_id)
-            if not file_info:
-                raise HTTPException(status_code=404, detail="file not found")
-            file_size = int(file_info.get('size', 0)) if file_info.get('size') else 0
-            content_type = file_info.get('mimeType') or 'application/octet-stream'
-            
-            def iter_gdrive():
-                try:
-                    for chunk in gdrive_service.download_file(file_id):
-                        yield chunk
-                except Exception as e:
-                    raise HTTPException(status_code=500, detail=str(e))
-            
-            headers = {
-                "Accept-Ranges": "bytes",
-                "Content-Type": content_type,
-            }
-            if file_size:
-                headers["Content-Length"] = str(file_size)
-            return StreamingResponse(iter_gdrive(), headers=headers)
-        except HTTPException:
-            raise
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=502, detail=f"drive metadata failed: {e}")
+        if not file_info:
+            raise HTTPException(status_code=404, detail="file not found")
+
+        file_size = int(file_info.get('size') or 0)
+        content_type = file_info.get('mimeType') or 'application/octet-stream'
+        requested = _parse_range_header(request.headers.get("range"), file_size)
+
+        try:
+            upstream = gdrive_service.open_media(
+                file_id,
+                start=requested[0] if requested else 0,
+                end=requested[1] if requested else None,
+            )
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"drive stream failed: {e}")
+
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Content-Type": content_type,
+        }
+        if upstream.status_code == 206:
+            content_range = upstream.headers.get("Content-Range")
+            if content_range:
+                headers["Content-Range"] = content_range
+            content_length = upstream.headers.get("Content-Length")
+            if content_length:
+                headers["Content-Length"] = content_length
+            return StreamingResponse(_iter_upstream(upstream), status_code=206, headers=headers)
+
+        # Google ignored the range: report the real size and serve from the start.
+        if file_size:
+            headers["Content-Length"] = str(file_size)
+        return StreamingResponse(_iter_upstream(upstream), headers=headers)
     
     try:
         ap = str(os.path.abspath(path))
@@ -129,24 +172,11 @@ def stream_file(path: str, request: Request):
 
     file_size = os.path.getsize(ap)
     range_header = request.headers.get("range")
-    start = 0
-    end = file_size - 1
-
-    if range_header:
-        try:
-            units, rng = range_header.split("=")
-            if units.strip() != "bytes":
-                raise ValueError("Only bytes range supported")
-            rstart, rend = rng.split("-")
-            if rstart:
-                start = int(rstart)
-            if rend:
-                end = int(rend)
-            if start > end or end >= file_size:
-                raise ValueError("Invalid range")
-        except Exception:
-            start = 0
-            end = file_size - 1
+    parsed = _parse_range_header(range_header, file_size)
+    if parsed:
+        start, end = parsed
+    else:
+        start, end = 0, file_size - 1
 
     chunk_size = 1024 * 1024
 
