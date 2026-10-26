@@ -145,8 +145,13 @@ def system_resume(_: bool = Depends(admin_or_localhost)):
 
 
 @router.get("/api/health")
-def healthcheck():
-    """Lightweight health endpoint for UI/tray diagnostics."""
+def healthcheck(providers: bool = True):
+    """Lightweight health endpoint for UI/tray diagnostics.
+
+    `providers=false` skips the Jikan/Kitsu probes. They do outbound HTTP with
+    their own timeouts, so on a slow or filtered network the first call can take
+    seconds; the Android client only needs to know that the server answers.
+    """
     try:
         db_ok = True
         db_detail = None
@@ -170,14 +175,18 @@ def healthcheck():
             movies_provider = core_config.get("metadata_movies_provider")  # type: ignore[attr-defined]
         except Exception:
             movies_provider = None
-        try:
-            jikan_health = jikan_provider.healthcheck() if jikan_provider is not None and hasattr(jikan_provider, "healthcheck") else None
-        except Exception as e:
-            jikan_health = {"ok": False, "detail": str(e)}
-        try:
-            kitsu_health = kitsu_provider.healthcheck() if kitsu_provider is not None and hasattr(kitsu_provider, "healthcheck") else None
-        except Exception as e:
-            kitsu_health = {"ok": False, "detail": str(e)}
+        if providers:
+            try:
+                jikan_health = jikan_provider.healthcheck() if jikan_provider is not None and hasattr(jikan_provider, "healthcheck") else None
+            except Exception as e:
+                jikan_health = {"ok": False, "detail": str(e)}
+            try:
+                kitsu_health = kitsu_provider.healthcheck() if kitsu_provider is not None and hasattr(kitsu_provider, "healthcheck") else None
+            except Exception as e:
+                kitsu_health = {"ok": False, "detail": str(e)}
+        else:
+            jikan_health = None
+            kitsu_health = None
         return {
             "ok": bool(db_ok),
             "db_ok": bool(db_ok),

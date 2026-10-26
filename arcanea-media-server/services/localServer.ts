@@ -57,7 +57,7 @@ async function waitForHealth(origin: string, timeoutMs: number): Promise<boolean
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 3000);
-      const res = await fetch(`${origin}/api/health`, { signal: controller.signal });
+      const res = await fetch(`${origin}/api/health?providers=0`, { signal: controller.signal });
       clearTimeout(timer);
       if (res.ok) return true;
     } catch {

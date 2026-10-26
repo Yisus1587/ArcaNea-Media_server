@@ -157,7 +157,9 @@ export async function checkServer(raw: string, timeoutMs: number = 6000): Promis
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(`${origin}/api/health`, {
+    // providers=0: the provider probes do outbound HTTP and can take seconds,
+    // which is exactly what this 6s validation timeout must not wait for.
+    const res = await fetch(`${origin}/api/health?providers=0`, {
       signal: controller.signal,
       headers: { Accept: 'application/json' },
     });
