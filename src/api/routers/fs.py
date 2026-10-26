@@ -11,8 +11,70 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 
 from ..deps import admin_required
+from ...core.config import IS_ANDROID
 
 router = APIRouter()
+
+# Android has no drive letters and no `/mnt` mounts: shared storage is
+# `/storage/emulated/0` (internal) and each SD card shows up as `/storage/<UUID>`,
+# while Termux exposes the same place as `~/storage/shared`. A path can exist but
+# still be unreadable without the storage permission, so it is reported with
+# zeroes instead of being dropped.
+ANDROID_INTERNAL_STORAGE = "/storage/emulated/0"
+ANDROID_STORAGE_SKIP = {"emulated", "self", "sdcard0", "enc_emulated", "run"}
+
+
+def _android_drive_candidates() -> list[tuple[str, str]]:
+    candidates: list[tuple[str, str]] = []
+    try:
+        if os.path.isdir(ANDROID_INTERNAL_STORAGE):
+            candidates.append((ANDROID_INTERNAL_STORAGE, "Almacenamiento interno"))
+    except Exception:
+        pass
+
+    try:
+        for name in sorted(os.listdir("/storage")):
+            if name in ANDROID_STORAGE_SKIP:
+                continue
+            path = os.path.join("/storage", name)
+            try:
+                if os.path.isdir(path):
+                    candidates.append((path, f"SD ({name})"))
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    try:
+        termux_shared = Path.home() / "storage" / "shared"
+        if termux_shared.is_dir():
+            candidates.append((str(termux_shared), "Termux (shared)"))
+    except Exception:
+        pass
+
+    return candidates
+
+
+def _desktop_placeholder_drives() -> list[dict]:
+    """Fallback used on desktop when drive listing fails; Android gets an empty list."""
+    return [
+        {
+            "path": "C:\\",
+            "label": "Windows (C:)",
+            "totalSpace": 256 * 1024 * 1024 * 1024,
+            "freeSpace": 150 * 1024 * 1024 * 1024,
+            "usedSpace": 106 * 1024 * 1024 * 1024,
+            "percentage": 41.4,
+        },
+        {
+            "path": "D:\\",
+            "label": "Data (D:)",
+            "totalSpace": 1024 * 1024 * 1024 * 1024,
+            "freeSpace": 800 * 1024 * 1024 * 1024,
+            "usedSpace": 224 * 1024 * 1024 * 1024,
+            "percentage": 21.9,
+        },
+    ]
 
 
 @router.get("/api/drives")
@@ -22,7 +84,33 @@ def list_drives(_: bool = Depends(admin_required)):
     try:
         system = platform.system()
 
-        if system == "Windows":
+        if IS_ANDROID:
+            for path, label in _android_drive_candidates():
+                try:
+                    usage = shutil.disk_usage(path)
+                    drives.append(
+                        {
+                            "path": path,
+                            "label": label,
+                            "totalSpace": usage.total,
+                            "freeSpace": usage.free,
+                            "usedSpace": usage.used,
+                            "percentage": (usage.used / usage.total) * 100 if usage.total > 0 else 0,
+                        }
+                    )
+                except Exception:
+                    drives.append(
+                        {
+                            "path": path,
+                            "label": label,
+                            "totalSpace": 0,
+                            "freeSpace": 0,
+                            "usedSpace": 0,
+                            "percentage": 0,
+                        }
+                    )
+
+        elif system == "Windows":
             import string
 
             for drive_letter in string.ascii_uppercase:
@@ -133,24 +221,8 @@ def list_drives(_: bool = Depends(admin_required)):
     except Exception as e:
         print(f"Error general en list_drives: {e}")
         print(traceback.format_exc())
-        drives = [
-            {
-                "path": "C:\\",
-                "label": "Windows (C:)",
-                "totalSpace": 256 * 1024 * 1024 * 1024,
-                "freeSpace": 150 * 1024 * 1024 * 1024,
-                "usedSpace": 106 * 1024 * 1024 * 1024,
-                "percentage": 41.4,
-            },
-            {
-                "path": "D:\\",
-                "label": "Data (D:)",
-                "totalSpace": 1024 * 1024 * 1024 * 1024,
-                "freeSpace": 800 * 1024 * 1024 * 1024,
-                "usedSpace": 224 * 1024 * 1024 * 1024,
-                "percentage": 21.9,
-            },
-        ]
+        # Android has no drive letters: an empty list is better than fake C:/D: units.
+        drives = [] if IS_ANDROID else _desktop_placeholder_drives()
 
     return {"drives": drives}
 
