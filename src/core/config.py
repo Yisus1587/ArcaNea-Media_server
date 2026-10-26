@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 import re
 import sqlite3
+import tempfile
 
 
 _logger = logging.getLogger(__name__)
@@ -117,8 +118,100 @@ try:
 except Exception:
     _data_override = ""
 
-DATA_DIR = Path(_data_override).resolve() if _data_override.strip() else (BASE_DIR / 'data')
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+def _detect_android() -> bool:
+    """True when running inside an Android app (Chaquopy/python-for-android) or Termux.
+
+    Embedded interpreters report `sys.platform == 'linux'`, so the platform has to be
+    detected explicitly (`ARCANEA_PLATFORM=android`) or from Android-only markers.
+    """
+    try:
+        if (os.environ.get("ARCANEA_PLATFORM") or "").strip().lower() == "android":
+            return True
+    except Exception:
+        pass
+    for key in ("ANDROID_DATA", "ANDROID_ROOT", "ANDROID_PRIVATE", "ANDROID_STORAGE"):
+        try:
+            if (os.environ.get(key) or "").strip():
+                return True
+        except Exception:
+            continue
+    try:
+        if Path("/system/build.prop").is_file():
+            return True
+    except Exception:
+        pass
+    try:
+        # Termux ships PREFIX=/data/data/com.termux/files/usr
+        if "com.termux" in (os.environ.get("PREFIX") or ""):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+IS_ANDROID = _detect_android()
+
+
+def _android_data_dir() -> Path | None:
+    """Writable app-private directory on Android (no storage permission needed).
+
+    Android gives the app no writable location next to its sources, and `/sdcard`
+    requires extra permissions, so the db/cache/logs live in the app sandbox.
+    """
+    candidates: list[Path] = []
+    try:
+        explicit = (os.environ.get("ARCANEA_ANDROID_DATA_DIR") or "").strip()
+        if explicit:
+            candidates.append(Path(explicit).expanduser())
+    except Exception:
+        pass
+    try:
+        # python-for-android exposes the app-private files dir.
+        private = (os.environ.get("ANDROID_PRIVATE") or "").strip()
+        if private:
+            candidates.append(Path(private).expanduser() / "arcanea")
+    except Exception:
+        pass
+    try:
+        prefix = (os.environ.get("PREFIX") or "").strip()
+        if "com.termux" in prefix:
+            # Termux: HOME is /data/data/com.termux/files/home; PREFIX/../home is the fallback.
+            home = (os.environ.get("HOME") or "").strip()
+            base = Path(home) if home else (Path(prefix).parent / "home")
+            candidates.append(base / ".arcanea")
+    except Exception:
+        pass
+    for cand in candidates:
+        try:
+            cand.mkdir(parents=True, exist_ok=True)
+            probe = cand / ".arcanea_write_test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+            return cand
+        except Exception as e:
+            _debug_suppressed(e)
+            continue
+    return None
+
+
+if _data_override.strip():
+    DATA_DIR = Path(_data_override).resolve()
+elif IS_ANDROID:
+    _android_dir = _android_data_dir()
+    DATA_DIR = _android_dir if _android_dir is not None else (Path(tempfile.gettempdir()) / "arcanea")
+else:
+    DATA_DIR = BASE_DIR / 'data'
+
+try:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+except Exception as e:
+    # Desktop keeps failing loudly; Android falls back to a path that always works.
+    if not IS_ANDROID:
+        raise
+    _debug_suppressed(e)
+    DATA_DIR = Path(tempfile.gettempdir()) / "arcanea"
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 config = {
     # include environment override first; then default media folder; then local 'Anime' attachment if present

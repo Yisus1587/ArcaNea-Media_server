@@ -9,6 +9,7 @@ network = importlib.import_module(".network", __name__)
 
 BASE_DIR = config.BASE_DIR
 DATA_DIR = config.DATA_DIR
+IS_ANDROID = config.IS_ANDROID
 get = config.get
 normalize_metadata_language = config.normalize_metadata_language
 set_temp_override = config.set_temp_override
@@ -18,6 +19,7 @@ __all__ = [
     "get",
     "BASE_DIR",
     "DATA_DIR",
+    "IS_ANDROID",
     "normalize_metadata_language",
     "set_temp_override",
     "network",

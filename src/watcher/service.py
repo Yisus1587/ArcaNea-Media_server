@@ -15,6 +15,16 @@ try:
     HAS_WATCHDOG = True
 except ImportError:
     HAS_WATCHDOG = False
+    Observer = None  # type: ignore[assignment]
+
+    class FileSystemEventHandler:  # type: ignore[no-redef]
+        """Stand-in base class used when watchdog is not installed (e.g. Android).
+
+        `WatchHandler` subclasses it unconditionally, so without this stub the
+        module would fail to import with a NameError before the polling fallback
+        ever gets a chance to run.
+        """
+
 
 logger = logging.getLogger(__name__)
 
