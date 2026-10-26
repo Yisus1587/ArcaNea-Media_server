@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { MediaService } from '../../services/api';
+import { MediaService, resolveAssetUrl } from '../../services/api';
 import { MediaCard } from './MediaCard';
 import { MediaItem } from '../../types';
 import { useI18n } from '../../i18n/i18n';
@@ -43,8 +43,8 @@ export const LibraryOverview: React.FC<{ onSelectMedia?: (it: MediaItem) => void
         return 'movie';
       })(),
       addedAt: s?.created_at || new Date().toISOString(),
-      thumbnailUrl: s?.poster_url || `/api/media/${s?.id}/poster`,
-      posterPath: s?.poster_url || `/api/media/${s?.id}/poster`,
+      thumbnailUrl: resolveAssetUrl(s?.poster_url || `/api/media/${s?.id}/poster`),
+      posterPath: resolveAssetUrl(s?.poster_url || `/api/media/${s?.id}/poster`),
     } as MediaItem;
   }
 

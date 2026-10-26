@@ -21,13 +21,39 @@ export function getServerOrigin(): string | null {
   return serverOrigin;
 }
 
-/** Make a URL usable outside the WebView (native player): relative ones get the page origin. */
+/** Make a URL usable outside the WebView (native player): relative ones get the server origin. */
 function absolutizeUrl(url: string): string {
   try {
-    return new URL(url, window.location.origin).toString();
+    // The WebView origin is `http://localhost` and has no backend behind it, so a
+    // configured server always wins over the page origin.
+    const base = serverOrigin || window.location.origin;
+    return new URL(url, base).toString();
   } catch {
     return url;
   }
+}
+
+/**
+ * Resolve a media URL (poster, backdrop, still) against the configured server.
+ *
+ * The APK serves its own build from `http://localhost`, so a relative
+ * `/media-assets/...` or `/api/media/1/poster` would be fetched from the app
+ * instead of from the server. Absolute (`http(s)://`, protocol-relative `//`),
+ * `data:` and `blob:` URLs, and any URL when no server is configured (the plain
+ * web build), are returned untouched.
+ */
+export function resolveAssetUrl(url: unknown): string {
+  if (typeof url !== 'string') return '';
+  const value = url.trim();
+  if (!value || !value.startsWith('/')) return value;
+  if (value.startsWith('//')) return value;
+  if (!serverOrigin) return value;
+  return `${serverOrigin.replace(/\/+$/, '')}${value}`;
+}
+
+/** Health URL of the resolved server; `providers=0` skips the outbound provider probes. */
+export function healthProbeUrl(): string {
+  return `${API_BASE}/health?providers=0`;
 }
 
 let adminMode = false;
@@ -275,7 +301,9 @@ function mapBackendItem(it: any): MediaItem {
     metaDataObj = {};
   }
 
-  const posterUrl = (typeof it.poster_url === 'string' && it.poster_url) ? it.poster_url : `/api/media/${it.id}/poster`;
+  const posterUrl = resolveAssetUrl(
+    (typeof it.poster_url === 'string' && it.poster_url) ? it.poster_url : `/api/media/${it.id}/poster`,
+  );
   const files = Array.isArray(it.files) ? it.files : [];
   const primaryPath = files.length ? files[0].path : (it.canonical_path || '');
 
@@ -330,13 +358,14 @@ function mapBackendItem(it: any): MediaItem {
       ? String((it as any).backdrop_url).trim()
       : undefined;
   const _isLocalAsset = (u?: string) => !!(u && u.trim().startsWith('/media-assets/'));
-  const resolvedBackdrop =
+  const resolvedBackdrop = resolveAssetUrl(
     (_isLocalAsset(manualBackdrop) ? manualBackdrop : undefined) ||
-    (_isLocalAsset(remoteBackdrop) ? remoteBackdrop : undefined) ||
-    manualBackdrop ||
-    remoteBackdrop ||
-    metaDataObj?.backdrop_path ||
-    undefined;
+      (_isLocalAsset(remoteBackdrop) ? remoteBackdrop : undefined) ||
+      manualBackdrop ||
+      remoteBackdrop ||
+      metaDataObj?.backdrop_path ||
+      undefined,
+  ) || undefined;
 
   const item: MediaItem = {
     id: String(it.id ?? ''),

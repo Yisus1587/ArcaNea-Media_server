@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Drive, MetadataConfig, ScanStatus, UserProfile, ViewState, AppStage } from '../types';
-import { MediaService, normalizeRoots, normalizeRootTypes, buildRootTypesPayload, getStatusWsUrls } from '../services/api';
+import { MediaService, normalizeRoots, normalizeRootTypes, buildRootTypesPayload, getStatusWsUrls, healthProbeUrl } from '../services/api';
 import { useI18n } from '../i18n/i18n';
 
 interface UseSettingsStateParams {
@@ -409,7 +409,9 @@ export const useSettingsState = ({
       const ac = new AbortController();
       const t = window.setTimeout(() => ac.abort(), 5000);
       try {
-        const res = await fetch('/api/health', { signal: ac.signal });
+        // Relative fetch would hit the APK's own WebView origin; the resolved base
+        // points at the server. providers=0 keeps this probe under a second.
+        const res = await fetch(healthProbeUrl(), { signal: ac.signal });
         if (cancelled) return;
         const ok = !!(res && res.ok);
         if (ok) {

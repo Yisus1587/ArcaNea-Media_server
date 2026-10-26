@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { X, Play, Plus, ThumbsUp, Calendar, Clock, RefreshCw, Wrench, ImageOff, Check } from 'lucide-react';
 import { MediaItem } from '../../types';
 import { Button } from '../ui/Button';
-import { MediaService } from '../../services/api';
+import { MediaService, resolveAssetUrl } from '../../services/api';
 import { useI18n } from '../../i18n/i18n';
 import { ManualMappingModal } from './ManualMappingModal';
 import { InlineLoader } from '../ui/InlineLoader';
@@ -603,7 +603,7 @@ export const MediaDetailModal: React.FC<MediaDetailModalProps> = ({ item, onClos
   const seasonPoster = (() => {
     try {
       const p = selectedDbSeason?.poster_path ?? selectedDbSeason?.posterPath ?? null;
-      if (typeof p === 'string' && p.trim()) return p.trim();
+      if (typeof p === 'string' && p.trim()) return resolveAssetUrl(p.trim());
     } catch {
       return null;
     }
@@ -613,7 +613,7 @@ export const MediaDetailModal: React.FC<MediaDetailModalProps> = ({ item, onClos
   const seasonBackdrop = (() => {
     try {
       const p = selectedDbSeason?.backdrop_path ?? selectedDbSeason?.backdropPath ?? null;
-      if (typeof p === 'string' && p.trim()) return p.trim();
+      if (typeof p === 'string' && p.trim()) return resolveAssetUrl(p.trim());
     } catch {
       return null;
     }
@@ -900,7 +900,7 @@ export const MediaDetailModal: React.FC<MediaDetailModalProps> = ({ item, onClos
                     {related.map((r: any) => (
                       <div key={r.id} className="flex items-center gap-4 p-3 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 transition-colors group">
                         <div className="w-16 h-24 rounded-lg overflow-hidden bg-slate-800 flex-shrink-0 shadow-lg border border-white/5">
-                          <img src={r.poster_url || item.thumbnailUrl || item.backdropUrl || fallbackPoster} className="w-full h-full object-cover transition-transform group-hover:scale-105" />
+                          <img src={resolveAssetUrl(r.poster_url) || item.thumbnailUrl || item.backdropUrl || fallbackPoster} className="w-full h-full object-cover transition-transform group-hover:scale-105" />
                         </div>
                         <div className="min-w-0 flex-1">
                           <div className="text-sm font-bold text-white truncate group-hover:text-indigo-400 transition-colors">{r.title}</div>
@@ -1051,7 +1051,9 @@ export const MediaDetailModal: React.FC<MediaDetailModalProps> = ({ item, onClos
                                   {visibleFiles.map((f: any, i: number) => {
                                       const fp = String(f?.path || '');
                                       const basePoster = (detail as any)?.posterPath || (item as any).posterPath || fallbackPoster;
-                                      const episodeThumb = (f?.stillPath || f?.still_path || (detail as any)?.backdropUrl || item.backdropUrl || basePoster) as string;
+                                      const episodeThumb = resolveAssetUrl(
+                                        (f?.stillPath || f?.still_path || (detail as any)?.backdropUrl || item.backdropUrl || basePoster) as string,
+                                      );
                                       const epNo = f?.index ?? f?.file_index ?? (currentStart + i + 1);
                                       const episodeWord = t('episode');
                                       const title = f?.episodeTitle ? String(f.episodeTitle) : `${episodeWord} ${epNo}`;
