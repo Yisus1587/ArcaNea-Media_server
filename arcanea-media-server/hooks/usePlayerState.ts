@@ -411,7 +411,7 @@ export const usePlayerState = ({
   const hasNextItem = playingFiles.length > 1 && playingFileIndex >= 0 && playingFileIndex < playingFiles.length - 1;
 
   const handleProgressUpdate = useCallback(
-    (payload: { current: number; duration: number; progress?: number; force?: boolean; ended?: boolean }) => {
+    (payload: { current: number; duration: number; progress?: number; force?: boolean; ended?: boolean; path?: string }) => {
       if (!playingMedia?.id) return;
       const now = Date.now();
       const force = !!payload.force || !!payload.ended;
@@ -419,7 +419,10 @@ export const usePlayerState = ({
       lastProgressSentRef.current = now;
       const position = Math.max(0, Number(payload.current || 0));
       const duration = Math.max(0, Number(payload.duration || 0));
-      const path = (playingMedia as any)?.path ? String((playingMedia as any).path) : null;
+      // The native player walks the season playlist on its own, so it reports the
+      // file it is actually playing instead of trusting the item the UI selected.
+      const reportedPath = payload.path ? String(payload.path) : null;
+      const path = reportedPath || ((playingMedia as any)?.path ? String((playingMedia as any).path) : null);
       MediaService.savePlaybackProgress(Number(playingMedia.id), { position, duration, path }, currentUser?.id).catch(() => {});
     },
     [currentUser?.id, playingMedia],

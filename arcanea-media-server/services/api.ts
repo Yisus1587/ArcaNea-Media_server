@@ -21,6 +21,15 @@ export function getServerOrigin(): string | null {
   return serverOrigin;
 }
 
+/** Make a URL usable outside the WebView (native player): relative ones get the page origin. */
+function absolutizeUrl(url: string): string {
+  try {
+    return new URL(url, window.location.origin).toString();
+  } catch {
+    return url;
+  }
+}
+
 let adminMode = false;
 let telemetryToken = '';
 
@@ -531,6 +540,36 @@ export const MediaService = {
 
   getStreamUrlFromPath(path: string): string {
     return `${API_BASE}/stream?path=${encodeURIComponent(path)}`;
+  },
+
+  /** Absolute form for the native player, which runs outside the WebView origin. */
+  getAbsoluteStreamUrl(path: string): string {
+    return absolutizeUrl(MediaService.getStreamUrlFromPath(path));
+  },
+
+  getSubtitleFileUrl(path: string): string {
+    return `${API_BASE}/subtitles/file?path=${encodeURIComponent(path)}`;
+  },
+
+  getAbsoluteSubtitleFileUrl(path: string): string {
+    return absolutizeUrl(MediaService.getSubtitleFileUrl(path));
+  },
+
+  /** Sidecar `.srt`/`.vtt`/`.ass` files next to a video (empty when there are none). */
+  async getSubtitleTracks(
+    path: string,
+  ): Promise<Array<{ label: string; language?: string | null; format: string; mime: string; path: string }>> {
+    if (!path) return [];
+    try {
+      const res = await fetch(`${API_BASE}/subtitles/tracks?path=${encodeURIComponent(path)}`, {
+        headers: adminHeadersAny(),
+      });
+      if (!res.ok) return [];
+      const data = await res.json();
+      return Array.isArray(data?.tracks) ? data.tracks : [];
+    } catch {
+      return [];
+    }
   },
 
   async startScan(): Promise<{ status: string }> {

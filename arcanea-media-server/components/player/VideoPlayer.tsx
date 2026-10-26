@@ -24,8 +24,12 @@ import {
   Lock,
   Unlock,
   Clock,
+  MonitorPlay,
 } from 'lucide-react';
 import { useI18n } from '../../i18n/i18n';
+import { MediaService } from '../../services/api';
+import { addNativeProgressListener, playNative, probeNativePlayer } from '../../services/nativePlayer';
+import type { NativeSubtitleTrack } from '../../services/nativePlayer';
 
 interface VideoPlayerProps {
   src: string;
@@ -49,7 +53,7 @@ interface VideoPlayerProps {
   subtitlesUrl?: string;
   autoPlay?: boolean;
   startTime?: number;
-  onProgressUpdate?: (payload: { current: number; duration: number; progress: number; force?: boolean; ended?: boolean }) => void;
+  onProgressUpdate?: (payload: { current: number; duration: number; progress: number; force?: boolean; ended?: boolean; path?: string }) => void;
 }
 
 interface PlayerState {
@@ -541,6 +545,8 @@ const ControlButtons: React.FC<{
   onFullscreenToggle: () => void;
   isLocked: boolean;
   onLockToggle: () => void;
+  nativePlayerAvailable?: boolean;
+  onNativePlayer?: () => void;
   compact?: boolean;
 }> = ({
   isPlaying,
@@ -578,6 +584,8 @@ const ControlButtons: React.FC<{
   onFullscreenToggle,
   isLocked,
   onLockToggle,
+  nativePlayerAvailable = false,
+  onNativePlayer,
   compact = false,
 }) => {
   const { t } = useI18n();
@@ -695,6 +703,17 @@ const ControlButtons: React.FC<{
             </button>
           ) : null}
 
+          {nativePlayerAvailable ? (
+            <button
+              onClick={onNativePlayer}
+              className="p-2 transition rounded-full text-slate-300 hover:text-white hover:bg-white/10"
+              aria-label={t('native_player')}
+              title={t('native_player')}
+            >
+              <MonitorPlay size={iconSize} />
+            </button>
+          ) : null}
+
           <div className="relative">
             {showSettings ? (
               <SettingsMenu
@@ -771,6 +790,9 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const [showContinueOverlay, setShowContinueOverlay] = useState(false);
   const [openSeasonKey, setOpenSeasonKey] = useState<string | null>(null);
   const [episodesPanelOpen, setEpisodesPanelOpen] = useState(false);
+  const [nativeActive, setNativeActive] = useState(false);
+  const [nativeAvailable, setNativeAvailable] = useState(false);
+  const nativeLaunchRef = useRef(false);
   const [brightness, setBrightness] = useState(100);
   const [contrast, setContrast] = useState(100);
   const [isCompact, setIsCompact] = useState<boolean>(() => {
@@ -846,6 +868,128 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     }
     onClose();
   }, [onClose]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void probeNativePlayer().then((ok) => {
+      if (!cancelled) setNativeAvailable(ok);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /**
+   * Hand playback to the native player (Media3/ExoPlayer).
+   *
+   * The WebView cannot decode MKV/HEVC, so this is both the manual button and
+   * the automatic fallback when <video> fails. The whole season goes with it so
+   * the native player keeps advancing episodes, and every progress report
+   * carries its own file path because the web item does not change underneath.
+   */
+  const openNativePlayer = useCallback(
+    async (startAt?: number) => {
+      if (!nativeAvailable || nativeLaunchRef.current) return;
+      nativeLaunchRef.current = true;
+      const video = videoRef.current;
+      const from = typeof startAt === 'number' && Number.isFinite(startAt) ? startAt : video?.currentTime || 0;
+      try {
+        const section = (episodeSeasons || []).find(
+          (s) =>
+            Array.isArray(s.episodes) &&
+            s.episodes.some((e: any) => String(e?.path || '') === String(currentPath || '')),
+        );
+        const source = section && section.episodes.length
+          ? section.episodes
+          : currentPath
+            ? [{ path: currentPath, episodeTitle: title }]
+            : [];
+        const files = source.filter((e: any) => e?.path).slice(0, 40);
+        if (!files.length) throw new Error('no playable files');
+
+        const items = await Promise.all(
+          files.map(async (file: any, index: number) => {
+            const path = String(file.path);
+            let subtitles: NativeSubtitleTrack[] = [];
+            try {
+              const tracks = await MediaService.getSubtitleTracks(path);
+              subtitles = tracks.map((track, trackIndex) => ({
+                url: MediaService.getAbsoluteSubtitleFileUrl(track.path),
+                mime: track.mime,
+                label: track.label,
+                language: track.language || undefined,
+                default: trackIndex === 0,
+              }));
+            } catch {
+              subtitles = [];
+            }
+            const fallbackTitle = path.split(/[\\/]/).pop() || '';
+            return {
+              url: MediaService.getAbsoluteStreamUrl(path),
+              title: String(file.episodeTitle || file.title || file.filename || fallbackTitle) || `Elemento ${index + 1}`,
+              path,
+              subtitles,
+            };
+          }),
+        );
+
+        const startIndex = Math.max(0, files.findIndex((file: any) => String(file.path) === String(currentPath || '')));
+        if (video) {
+          try {
+            video.pause();
+          } catch {
+            // ignore
+          }
+        }
+        setNativeActive(true);
+        const removeListener = await addNativeProgressListener((event) => {
+          const item = items[event.index] || items[startIndex];
+          const duration = event.durationMs / 1000;
+          onProgressUpdate?.({
+            current: event.positionMs / 1000,
+            duration,
+            progress: event.durationMs > 0 ? (event.positionMs / event.durationMs) * 100 : 0,
+            path: item?.path,
+          });
+        });
+
+        const result = await playNative({
+          items,
+          startIndex,
+          startPositionMs: from * 1000,
+          title,
+          preferredTextLanguage: state.subtitlesEnabled ? items[startIndex]?.subtitles?.[0]?.language : undefined,
+          showSubtitles: state.subtitlesEnabled,
+        });
+        removeListener();
+        setNativeActive(false);
+
+        const item = items[result.index] || items[startIndex];
+        if (result.durationMs > 0) {
+          onProgressUpdate?.({
+            current: result.positionMs / 1000,
+            duration: result.durationMs / 1000,
+            progress: result.durationMs > 0 ? (result.positionMs / result.durationMs) * 100 : 0,
+            force: true,
+            ended: result.ended,
+            path: item?.path,
+          });
+        }
+        if (result.error) {
+          dispatch({ type: 'SET_ERROR', payload: result.error });
+          return;
+        }
+        handleClose();
+      } catch (error) {
+        console.error('Native playback failed', error);
+        setNativeActive(false);
+        dispatch({ type: 'SET_ERROR', payload: t('native_player_failed') });
+      } finally {
+        nativeLaunchRef.current = false;
+      }
+    },
+    [currentPath, episodeSeasons, handleClose, nativeAvailable, onProgressUpdate, state.subtitlesEnabled, t, title],
+  );
 
   const togglePlay = useCallback(() => {
     if (state.isLocked) return;
@@ -1405,6 +1549,10 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         onError={() => {
           dispatch({ type: 'SET_PLAYING', payload: false });
           dispatch({ type: 'SET_BUFFERING', payload: false });
+          if (nativeAvailable && !nativeActive) {
+            void openNativePlayer();
+            return;
+          }
           dispatch({ type: 'SET_ERROR', payload: t('load_video_error') });
         }}
       >
@@ -1419,6 +1567,14 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
           />
         ) : null}
       </video>
+
+      {nativeActive ? (
+        <div className="absolute inset-0 z-[60] flex flex-col items-center justify-center gap-3 bg-[#05070c] px-6 text-center">
+          <MonitorPlay size={48} className="text-indigo-300" />
+          <div className="text-sm font-semibold text-white">{t('native_player_active')}</div>
+          <div className="max-w-sm text-xs text-slate-400">{t('native_player_playing')}</div>
+        </div>
+      ) : null}
 
       <div
         className={`absolute top-0 left-0 right-0 h-40 bg-gradient-to-b from-black/80 via-black/40 to-transparent pointer-events-none transition-opacity duration-500 ${
@@ -1669,6 +1825,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
           onFullscreenToggle={toggleFullscreen}
           isLocked={state.isLocked}
           onLockToggle={() => dispatch({ type: 'TOGGLE_LOCK' })}
+          nativePlayerAvailable={nativeAvailable}
+          onNativePlayer={() => void openNativePlayer()}
           compact={isCompact}
         />
         </div>

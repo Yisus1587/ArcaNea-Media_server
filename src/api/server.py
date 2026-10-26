@@ -42,6 +42,7 @@ from .routers import localize as localize_router
 from .routers import anime_normalize as anime_normalize_router
 from .routers import user_list as user_list_router
 from .routers import stream as stream_router
+from .routers import subtitles as subtitles_router
 from .routers import telemetry as telemetry_router
 from .routers import data_control as data_control_router
 from .routers import gdrive as gdrive_router
@@ -119,6 +120,7 @@ app.include_router(localize_router.router)
 app.include_router(anime_normalize_router.router)
 app.include_router(user_list_router.router)
 app.include_router(stream_router.router)
+app.include_router(subtitles_router.router)
 app.include_router(telemetry_router.router)
 app.include_router(data_control_router.router)
 app.include_router(gdrive_router.router)

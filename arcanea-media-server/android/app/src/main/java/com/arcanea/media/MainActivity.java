@@ -9,6 +9,7 @@ public class MainActivity extends BridgeActivity {
     public void onCreate(Bundle savedInstanceState) {
         // Register before super.onCreate so the bridge exposes the plugin to the WebView.
         registerPlugin(LocalServerPlugin.class);
+        registerPlugin(NativePlayerPlugin.class);
         super.onCreate(savedInstanceState);
     }
 }

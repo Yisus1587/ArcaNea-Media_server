@@ -13,4 +13,6 @@ ext {
     androidxJunitVersion = '1.3.0'
     androidxEspressoCoreVersion = '3.7.0'
     cordovaAndroidVersion = '14.0.1'
+    // Reproductor nativo. Requiere compileSdk 36, que ya esta configurado.
+    media3Version = '1.11.1'
 }

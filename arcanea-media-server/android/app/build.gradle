@@ -72,6 +72,10 @@ dependencies {
     implementation "androidx.coordinatorlayout:coordinatorlayout:$androidxCoordinatorLayoutVersion"
     implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
     implementation project(':capacitor-android')
+    // Reproductor nativo: Matroska/HEVC y pistas de subtitulo embebidas, con
+    // seleccion de pista (audio/subtitulos) y soporte de rangos HTTP.
+    implementation "androidx.media3:media3-exoplayer:$media3Version"
+    implementation "androidx.media3:media3-ui:$media3Version"
     testImplementation "junit:junit:$junitVersion"
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"

@@ -26,6 +26,15 @@
 
         </activity>
 
+        <!-- Reproductor nativo (Media3/ExoPlayer): reproduce MKV/HEVC y subtitulos
+             que el WebView no puede decodificar. Pantalla completa, sin barra. -->
+        <activity
+            android:name=".NativePlayerActivity"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|screenLayout|uiMode|density"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
+
         <!-- Servidor local embebido: Android mata los hilos en segundo plano, asi que
              uvicorn corre dentro de un servicio en primer plano con notificacion. -->
         <service
