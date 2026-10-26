@@ -90,6 +90,11 @@ def _ensure_dev_file_logging() -> None:
 origins = [
     'http://localhost:9800',
     'http://127.0.0.1:9800',
+    # Capacitor WebView origins: the Android app runs as a native client pointing
+    # at a server on the LAN, so its requests are cross-origin.
+    'http://localhost',
+    'https://localhost',
+    'capacitor://localhost',
 ]
 
 app.add_middleware(

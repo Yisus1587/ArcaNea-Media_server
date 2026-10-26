@@ -1,8 +1,25 @@
 import { MediaItem, ScanStatus, Drive } from '../types';
 import { MOCK_MEDIA } from '../constants';
 import { getUiLang } from '../i18n/i18n';
+import { apiBasePath, buildApiBase, buildWsOrigin, normalizeServerOrigin } from './serverUrl';
 
-const API_BASE = '/api';
+export { normalizeServerOrigin };
+
+// Relative on the web build (Vite and FastAPI serve the same origin), or an absolute
+// base such as `http://192.168.1.10:9800/api` when the app runs as a native client
+// against a server on the LAN.
+let API_BASE = '/api';
+let serverOrigin: string | null = null;
+
+/** Point every request (HTTP, WebSocket, SSE) at a server; `null` restores the web behavior. */
+export function setServerOrigin(raw: string | null | undefined): void {
+  serverOrigin = normalizeServerOrigin(raw);
+  API_BASE = buildApiBase(serverOrigin);
+}
+
+export function getServerOrigin(): string | null {
+  return serverOrigin;
+}
 
 let adminMode = false;
 let telemetryToken = '';
@@ -54,6 +71,9 @@ function profileHeaders(profileId?: string): HeadersInit | undefined {
 
 function getBrowserOrigins(): { origin: string; wsOrigin: string } | null {
   try {
+    if (serverOrigin) {
+      return { origin: serverOrigin, wsOrigin: buildWsOrigin(serverOrigin) };
+    }
     if (typeof window === 'undefined') return null;
     const protocol = window.location.protocol || 'http:';
     const host = window.location.host;
@@ -68,10 +88,19 @@ function getBrowserOrigins(): { origin: string; wsOrigin: string } | null {
 }
 
 function _getDirectApiBases(): string[] {
+  if (API_BASE.startsWith('http')) return [API_BASE];
   // Always mirror the browser origin (protocol/host/port).
   const origins = getBrowserOrigins();
   if (!origins) return [];
   return [`${origins.origin}${API_BASE}`];
+}
+
+/** Build a WebSocket/SSE friendly base for the given origin, honouring an absolute API base. */
+function _apiBaseFor(origin: string): string {
+  if (API_BASE.startsWith('http')) {
+    return `${origin}${apiBasePath(API_BASE)}`;
+  }
+  return `${origin}${API_BASE}`;
 }
 
 export function getStatusWsUrls(): string[] {
@@ -81,7 +110,7 @@ export function getStatusWsUrls(): string[] {
     if (!token) return [];
     const origins = getBrowserOrigins();
     if (!origins) return [];
-    const sameHost = `${origins.wsOrigin}${API_BASE}/ws/status?admin_token=${encodeURIComponent(token)}`;
+    const sameHost = `${_apiBaseFor(origins.wsOrigin)}/ws/status?admin_token=${encodeURIComponent(token)}`;
     return [sameHost];
   } catch {
     return [];
@@ -96,14 +125,14 @@ export function getTelemetrySseUrls(): string[] {
     const token = getAdminToken();
     const urls: string[] = [];
     if (telemetryToken) {
-      urls.push(`${origins.origin}${API_BASE}/telemetry/stream?telemetry_token=${encodeURIComponent(telemetryToken)}`);
+      urls.push(`${_apiBaseFor(origins.origin)}/telemetry/stream?telemetry_token=${encodeURIComponent(telemetryToken)}`);
     }
     if (token) {
-      urls.push(`${origins.origin}${API_BASE}/telemetry/stream?admin_token=${encodeURIComponent(token)}`);
+      urls.push(`${_apiBaseFor(origins.origin)}/telemetry/stream?admin_token=${encodeURIComponent(token)}`);
     }
     // Only include unauthenticated fallback when no token is available, to avoid 403 retry loops.
     if (!urls.length) {
-      urls.push(`${origins.origin}${API_BASE}/telemetry/stream`);
+      urls.push(`${_apiBaseFor(origins.origin)}/telemetry/stream`);
     }
     return urls;
   } catch {

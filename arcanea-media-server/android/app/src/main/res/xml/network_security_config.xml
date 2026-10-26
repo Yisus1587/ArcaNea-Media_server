@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  El modo cliente habla con un servidor ArcaNea en la red local por HTTP plano
+  (una IP privada no tiene certificado válido) y el modo servidor local usa
+  127.0.0.1. Android bloquea el tráfico claro por defecto desde API 28, así que
+  se permite explícitamente manteniendo las CA del sistema para las conexiones
+  HTTPS (por ejemplo, la API de Google Drive).
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

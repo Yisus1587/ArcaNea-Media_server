@@ -42,13 +42,41 @@ if (!rootElement) {
 }
 
 const root = ReactDOM.createRoot(rootElement);
-root.render(
-  <React.StrictMode>
-    <I18nProvider>
-      <App />
-    </I18nProvider>
-  </React.StrictMode>
-);
+
+function renderApp() {
+  root.render(
+    <React.StrictMode>
+      <I18nProvider>
+        <App />
+      </I18nProvider>
+    </React.StrictMode>
+  );
+}
+
+// On the web this resolves to "no setup needed" and renders exactly as before; on a
+// native client it restores the server address from Preferences (or asks for it).
+async function bootstrap() {
+  try {
+    const { initServerConfig } = await import('./services/serverConfig');
+    const { needsSetup } = await initServerConfig();
+    if (needsSetup) {
+      const { ServerConnectScreen } = await import('./components/setup/ServerConnectScreen');
+      root.render(
+        <React.StrictMode>
+          <I18nProvider>
+            <ServerConnectScreen onConnected={() => renderApp()} />
+          </I18nProvider>
+        </React.StrictMode>
+      );
+      return;
+    }
+  } catch {
+    // Never block the web app on native-only bootstrap.
+  }
+  renderApp();
+}
+
+void bootstrap();
 
 if (!shouldClearStorage && import.meta.env.PROD && 'serviceWorker' in navigator) {
   window.addEventListener('load', () => {
