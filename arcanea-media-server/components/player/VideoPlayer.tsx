@@ -1486,7 +1486,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         if (state.isPlaying && !state.showSettings) dispatch({ type: 'SET_SHOW_CONTROLS', payload: false });
       }}
       onClick={handleContainerClick}
-      className={`fixed inset-0 z-[200] w-screen h-screen bg-[#05070c] flex flex-col justify-center overflow-hidden font-sans select-none group/player text-white ${
+      className={`fixed inset-0 z-[200] w-full h-dvh bg-[#05070c] flex flex-col justify-center overflow-hidden font-sans select-none group/player text-white ${
         state.isIdle ? 'cursor-none' : 'cursor-default'
       }`}
       role="region"
@@ -1670,7 +1670,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         </div>
       )}
 
-      <div className={`absolute top-0 left-0 right-0 ${isCompact ? 'p-3' : 'p-6'} flex justify-between items-start z-50 transition-transform duration-300 ${state.showControls ? 'translate-y-0' : '-translate-y-20'}`}>
+      <div className={`absolute top-0 left-0 right-0 ${isCompact ? 'p-3' : 'p-6'} pt-[env(safe-area-inset-top)] flex justify-between items-start z-50 transition-transform duration-300 ${state.showControls ? 'translate-y-0' : '-translate-y-20'}`}>
         <div className="flex flex-col min-w-0">
           <h1 className={`font-bold text-white tracking-tight truncate ${isCompact ? 'text-base' : 'text-xl md:text-2xl'}`}>{title}</h1>
           {nowPlayingLabel && <span className="text-xs text-indigo-300 font-medium tracking-wider uppercase mt-1 truncate" title={nowPlayingLabel}>{nowPlayingLabel}</span>}

@@ -145,7 +145,7 @@ export function ServerConnectScreen(props: { onConnected: (origin: string) => vo
     'mt-2 w-full rounded-xl bg-slate-950/70 border border-white/10 px-3 py-2.5 text-sm text-white placeholder:text-slate-500 focus:outline-none focus:border-indigo-400/60';
 
   return (
-    <div className="min-h-screen w-full flex items-center justify-center bg-slate-950 p-6">
+    <div className="min-h-dvh w-full flex items-center justify-center bg-slate-950 p-6 pt-[calc(1.5rem+env(safe-area-inset-top,0px))] pb-[calc(1.5rem+env(safe-area-inset-bottom,0px))] overflow-y-auto">
       <div className="w-full max-w-md rounded-2xl border border-white/10 bg-slate-900/60 shadow-2xl p-6">
         <div className="flex items-center gap-3">
           <div className="w-11 h-11 rounded-xl bg-indigo-500/15 border border-indigo-400/20 flex items-center justify-center text-indigo-200">

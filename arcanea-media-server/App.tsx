@@ -562,7 +562,7 @@ function App() {
   };
 
   return (
-    <div className="app-shell min-h-screen text-slate-100 flex overflow-hidden font-sans selection:bg-indigo-500/30 relative">
+    <div className="app-shell min-h-dvh pt-[env(safe-area-inset-top)] pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)] text-slate-100 flex overflow-hidden font-sans selection:bg-indigo-500/30 relative">
       {/* Offline Overlay */}
       {serverOffline && !dismissOffline ? (
         <div className="fixed inset-0 z-[999] bg-black/75 backdrop-blur-sm flex items-center justify-center p-6">

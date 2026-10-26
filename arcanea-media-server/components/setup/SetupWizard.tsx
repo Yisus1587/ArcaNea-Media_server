@@ -207,7 +207,7 @@ export const SetupWizard: React.FC<SetupWizardProps> = ({ onComplete }) => {
   };
 
   return (
-    <div className="min-h-screen bg-[#0b1220] flex items-center justify-center p-6 relative overflow-hidden">
+    <div className="min-h-dvh bg-[#0b1220] flex items-center justify-center p-6 pt-[calc(1.5rem+env(safe-area-inset-top,0px))] relative overflow-y-auto">
       {/* Background Ambience */}
       <div className="absolute inset-0 bg-gradient-to-br from-indigo-900/20 via-[#0b1220] to-[#0b1220] z-0" />
       <div className="absolute -top-40 -right-40 w-96 h-96 bg-purple-600/20 rounded-full blur-3xl animate-pulse" />

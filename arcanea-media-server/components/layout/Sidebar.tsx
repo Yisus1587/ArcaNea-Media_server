@@ -94,7 +94,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
     <>
     <aside 
       data-arcanea-sidebar="1"
-      className={`hidden sm:flex fixed top-0 left-0 h-full z-40 bg-[#0b1220]/95 backdrop-blur-xl border-r border-white/5 transition-all duration-300 flex-col ${
+      className={`hidden sm:flex fixed top-0 left-0 h-full z-40 bg-[#0b1220]/95 backdrop-blur-xl border-r border-white/5 transition-all duration-300 flex-col pt-[env(safe-area-inset-top)] pl-[env(safe-area-inset-left)] ${
         isOpen ? 'w-56 sm:w-64' : 'w-16 sm:w-20'
       }`}
     >
@@ -328,7 +328,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
     {/* Mobile header + bottom navigation */}
     {isMobile ? (
       <>
-        <div className="fixed top-0 left-0 right-0 z-50 bg-[#0b1220]/80 backdrop-blur-xl border-b border-white/5">
+        <div className="fixed top-0 left-0 right-0 z-50 bg-[#0b1220]/80 backdrop-blur-xl border-b border-white/5 pt-[env(safe-area-inset-top)] pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)]">
           <div className="h-14 flex items-center justify-between px-4">
             <div className="flex items-center gap-3">
               <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center shadow-lg shadow-indigo-500/20">
@@ -361,7 +361,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         {isOpen ? (
           <>
             <div className="fixed inset-0 z-40 bg-black/60 backdrop-blur-sm" onClick={() => onRequestClose?.()} aria-hidden="true" />
-            <div className="fixed top-14 left-0 right-0 z-50 p-4 bg-[#0b1220]/95 backdrop-blur-2xl border-b border-white/5 animate-in slide-in-from-top duration-300">
+            <div className="fixed left-0 right-0 z-50 p-4 bg-[#0b1220]/95 backdrop-blur-2xl border-b border-white/5 animate-in slide-in-from-top duration-300 top-[calc(3.5rem+env(safe-area-inset-top,0px))]">
               <div className="relative group">
                 <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-indigo-400 transition-colors" size={18} />
                 <input 
@@ -450,7 +450,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             </div>
           </div>
         )}
-        <nav className="fixed bottom-0 left-0 right-0 z-50 bg-[#0b1220]/95 backdrop-blur-xl border-t border-white/5 pb-[env(safe-area-inset-bottom)]">
+        <nav className="fixed bottom-0 left-0 right-0 z-50 bg-[#0b1220]/95 backdrop-blur-xl border-t border-white/5 pb-[env(safe-area-inset-bottom)] pl-[env(safe-area-inset-left)] pr-[env(safe-area-inset-right)]">
           <div className="h-16 flex items-center justify-around px-2">
             {navItems.map((item) => {
               const Icon = item.icon;

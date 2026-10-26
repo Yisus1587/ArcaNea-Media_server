@@ -172,7 +172,7 @@ export function FolderPickerModal(props: {
   if (typeof document === 'undefined') return null;
 
   const modal = (
-    <div translate="no" className="notranslate fixed inset-0 z-[240] flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+    <div translate="no" className="notranslate fixed inset-0 z-[240] flex items-center justify-center bg-black/70 backdrop-blur-sm p-4 pt-[calc(1rem+env(safe-area-inset-top,0px))] pb-[calc(1rem+env(safe-area-inset-bottom,0px))]">
       <div className="w-full max-w-3xl rounded-2xl border border-white/10 bg-slate-950/90 shadow-2xl overflow-hidden">
         <div className="flex items-center justify-between px-5 py-4 border-b border-white/10">
           <div className="min-w-0">
