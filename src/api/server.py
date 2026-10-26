@@ -44,6 +44,7 @@ from .routers import user_list as user_list_router
 from .routers import stream as stream_router
 from .routers import telemetry as telemetry_router
 from .routers import data_control as data_control_router
+from .routers import gdrive as gdrive_router
 from ..services import media_pipeline as scan_service
 from ..services import telemetry
 
@@ -115,6 +116,7 @@ app.include_router(user_list_router.router)
 app.include_router(stream_router.router)
 app.include_router(telemetry_router.router)
 app.include_router(data_control_router.router)
+app.include_router(gdrive_router.router)
 
 # Serve locally cached media assets (posters/backdrops) under a non-conflicting path
 try:

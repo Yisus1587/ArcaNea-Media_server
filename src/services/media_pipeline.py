@@ -14,6 +14,10 @@ from sqlalchemy import or_
 from ..db import SessionLocal
 from ..db import models
 from ..scanner.scanner import Scanner
+try:
+    from ..scanner.gdrive_scanner import GoogleDriveScanner
+except Exception:
+    GoogleDriveScanner = None
 from ..utils.path_hash import hash_path
 from . import telemetry
 from .dispatch_enrichment import dispatch_enrichment_by_roots
@@ -543,9 +547,28 @@ def _update_titles_total() -> None:
 
 
 def _scan_path_incremental(path: str, *, task_id: str | None = None) -> dict:
+    if str(path).startswith('gdrive://'):
+        if GoogleDriveScanner is None:
+            return {"status": "error", "detail": "gdrive_scanner_unavailable"}
+        try:
+            scanner = GoogleDriveScanner()
+            scanner.scan_path(str(path))
+            _update_titles_total()
+            set_scan_state({"status": "idle", "phase": "scan_done", "current": None, "finished_at": int(time.time()), "task_id": None, "task_kind": None})
+            return {"status": "ok", "path": str(path)}
+        except Exception as exc:
+            logger.exception("gdrive scan failed for %s", path)
+            set_scan_state({"status": "idle", "phase": "scan_done", "current": None, "finished_at": int(time.time())})
+            return {"status": "error", "detail": str(exc), "path": str(path)}
     scanner = Scanner(discovery_only=False)
-    exts = _media_exts(scanner)
-    p = Path(str(path)).resolve()
+    try:
+        p = Path(str(path)).resolve()
+    except Exception:
+        p = Path(str(path))
+    try:
+        exts = _media_exts(scanner)
+    except Exception:
+        exts = ()
     if not _is_under_configured_root(p):
         contained_roots = _contained_roots_for(str(p))
         if not contained_roots:

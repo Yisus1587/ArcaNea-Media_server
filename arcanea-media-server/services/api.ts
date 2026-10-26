@@ -1220,6 +1220,34 @@ export const MediaService = {
     }
   },
 
+  async getGDriveAuthUrl(): Promise<{ auth_url: string }> {
+    const res = await fetchWithFallback(`${API_BASE}/gdrive/auth/url`, { headers: adminHeadersAny() });
+    if (!res.ok) throw new Error('Failed to get auth url');
+    return res.json();
+  },
+
+  async getGDriveStatus(): Promise<{ authenticated: boolean }> {
+    const res = await fetchWithFallback(`${API_BASE}/gdrive/status`, { headers: adminHeadersAny() });
+    if (!res.ok) throw new Error('Failed to get status');
+    return res.json();
+  },
+
+  async listGDriveFolders(parentId: string = 'root'): Promise<{ folders: any[] }> {
+    const res = await fetchWithFallback(`${API_BASE}/gdrive/folders?parent_id=${encodeURIComponent(parentId)}`, { headers: adminHeadersAny() });
+    if (!res.ok) throw new Error('Failed to list folders');
+    return res.json();
+  },
+
+  async addGDriveRoot(folderId: string, folderName?: string, type?: string): Promise<any> {
+    const res = await fetchWithFallback(`${API_BASE}/gdrive/roots`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(adminHeadersAny() || {}) },
+      body: JSON.stringify({ folder_id: folderId, folder_name: folderName, type }),
+    });
+    if (!res.ok) throw new Error('Failed to add gdrive root');
+    return res.json();
+  },
+
   async getHealth(): Promise<any> {
     try {
       const res = await fetchWithFallback(`${API_BASE}/health`);

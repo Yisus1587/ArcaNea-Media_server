@@ -499,6 +499,13 @@ def main():
 
         ensure_columns('media_item', ALTER_STATEMENTS)
         ensure_columns('play_history', PLAY_HISTORY_ALTERS)
+        try:
+            mr_cols = get_columns(conn, 'media_root')
+            if 'kind' not in mr_cols:
+                print('Applying: ALTER TABLE media_root ADD COLUMN kind TEXT;')
+                conn.execute("ALTER TABLE media_root ADD COLUMN kind TEXT;")
+        except Exception:
+            pass
         # create media_image table
         print("Ensuring media_image table exists")
         conn.execute(MEDIA_IMAGE_CREATE)

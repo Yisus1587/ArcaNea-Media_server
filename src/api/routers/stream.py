@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import mimetypes
 import os
 
@@ -8,6 +9,10 @@ from fastapi.responses import StreamingResponse
 
 from ...core.config import get as get_config
 from ...db import SessionLocal, models
+try:
+    from ...services.gdrive import gdrive_service
+except Exception:
+    gdrive_service = None
 
 router = APIRouter()
 
@@ -59,6 +64,38 @@ def stream_file(path: str, request: Request):
     """Stream a local file with support for Range requests."""
     if not path:
         raise HTTPException(status_code=400, detail="path is required")
+    
+    # Handle Google Drive files
+    if str(path).startswith('gdrive://'):
+        if not gdrive_service or not gdrive_service.is_authenticated():
+            raise HTTPException(status_code=401, detail="Google Drive not authenticated")
+        file_id = str(path).replace('gdrive://', '').strip()
+        try:
+            file_info = gdrive_service.get_file(file_id)
+            if not file_info:
+                raise HTTPException(status_code=404, detail="file not found")
+            file_size = int(file_info.get('size', 0)) if file_info.get('size') else 0
+            content_type = file_info.get('mimeType') or 'application/octet-stream'
+            
+            def iter_gdrive():
+                try:
+                    for chunk in gdrive_service.download_file(file_id):
+                        yield chunk
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=str(e))
+            
+            headers = {
+                "Accept-Ranges": "bytes",
+                "Content-Type": content_type,
+            }
+            if file_size:
+                headers["Content-Length"] = str(file_size)
+            return StreamingResponse(iter_gdrive(), headers=headers)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
     try:
         ap = str(os.path.abspath(path))
     except Exception:

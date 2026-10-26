@@ -196,6 +196,8 @@ class MediaRoot(Base):
     type = Column(String, nullable=True)
     # `source` indicates how the type was set: 'auto' or 'manual'
     source = Column(String, nullable=True, default='auto')
+    # `kind` indicates root type: 'local' or 'gdrive' etc
+    kind = Column(String, nullable=True, default='local')
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 
