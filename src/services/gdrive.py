@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -25,8 +26,35 @@ logger = logging.getLogger(__name__)
 
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 
+# No client ID or secret is hardcoded in this project: every ArcaNea
+# installation is meant to use its own Google Cloud project. The client comes
+# either from DATA_DIR/gdrive_credentials.json (uploaded by the admin) or,
+# for whoever builds their own APK/binary, from these two environment
+# variables, which take precedence over the file.
+CLIENT_ID_ENV = 'ARCANEA_GDRIVE_CLIENT_ID'
+CLIENT_SECRET_ENV = 'ARCANEA_GDRIVE_CLIENT_SECRET'
+
 CREDENTIALS_FILE = DATA_DIR / 'gdrive_credentials.json'
 TOKEN_FILE = DATA_DIR / 'gdrive_token.json'
+FLOW_FILE = DATA_DIR / 'gdrive_flow.json'
+
+
+def _env_client_config() -> Optional[Dict[str, Any]]:
+    """Client settings from environment variables, shaped like Google's
+    "installed" JSON so it feeds the same OAuth flow as an uploaded file."""
+    client_id = (os.environ.get(CLIENT_ID_ENV) or '').strip()
+    client_secret = (os.environ.get(CLIENT_SECRET_ENV) or '').strip()
+    if not client_id or not client_secret:
+        return None
+    return {
+        'installed': {
+            'client_id': client_id,
+            'client_secret': client_secret,
+            'auth_uri': 'https://accounts.google.com/o/oauth2/auth',
+            'token_uri': 'https://oauth2.googleapis.com/token',
+            'redirect_uris': ['http://localhost'],
+        }
+    }
 
 
 class GoogleDriveService:
@@ -90,40 +118,92 @@ class GoogleDriveService:
     
     def is_authenticated(self) -> bool:
         return self.service is not None
-    
-    def get_auth_url(self, redirect_uri: str) -> Optional[str]:
-        if Flow is None or not CREDENTIALS_FILE.exists():
-            logger.error("No credentials file found or google-auth-oauthlib not available")
+
+    def _client_config(self) -> Optional[Dict[str, Any]]:
+        """OAuth client in use (env vars first, then the uploaded file)."""
+        env_cfg = _env_client_config()
+        if env_cfg:
+            return env_cfg
+        if not CREDENTIALS_FILE.exists():
             return None
         try:
-            flow = Flow.from_client_secrets_file(
-                str(CREDENTIALS_FILE),
+            with open(CREDENTIALS_FILE, encoding='utf-8') as f:
+                cfg = json.load(f)
+        except Exception:
+            logger.error("gdrive_credentials.json ilegible")
+            return None
+        if not isinstance(cfg, dict):
+            return None
+        if isinstance(cfg.get('installed'), dict) or isinstance(cfg.get('web'), dict):
+            return cfg
+        return None
+
+    def credentials_present(self) -> bool:
+        return self._client_config() is not None
+
+    def client_type(self) -> Optional[str]:
+        """'installed', 'web' or None."""
+        cfg = self._client_config()
+        if not isinstance(cfg, dict):
+            return None
+        if isinstance(cfg.get('installed'), dict):
+            return 'installed'
+        if isinstance(cfg.get('web'), dict):
+            return 'web'
+        return None
+
+    def clear_token(self) -> None:
+        """Forget the stored authorization; the next use needs a new consent."""
+        for f in (TOKEN_FILE, FLOW_FILE):
+            try:
+                if f.exists():
+                    f.unlink()
+            except Exception as e:
+                logger.error(f"Error deleting {f}: {e}")
+        self.service = None
+        self.creds = None
+
+    def get_auth_url(self, redirect_uri: str) -> Optional[str]:
+        cfg = self._client_config()
+        if Flow is None or cfg is None:
+            logger.error("No OAuth client configured or google-auth-oauthlib not available")
+            return None
+        try:
+            flow = Flow.from_client_config(
+                cfg,
                 scopes=SCOPES,
                 redirect_uri=redirect_uri
             )
-            auth_url, _ = flow.authorization_url(prompt='consent')
+            # google-auth-oauthlib >= 1.0 has no Flow.state attribute: the
+            # state comes back from authorization_url() and must be stored
+            # here to be checked on the callback (CSRF protection).
+            state = secrets.token_urlsafe(32)
+            auth_url, _ = flow.authorization_url(prompt='consent', state=state)
             # Store flow for later
-            flow_file = DATA_DIR / 'gdrive_flow.json'
-            with open(flow_file, 'w') as f:
+            with open(FLOW_FILE, 'w') as f:
                 json.dump({
                     'client_config': flow.client_config,
                     'redirect_uri': redirect_uri,
-                    'state': flow.state
+                    'state': state
                 }, f)
             return auth_url
         except Exception as e:
             logger.error(f"Error getting auth url: {e}")
             return None
     
-    def authenticate(self, code: str, redirect_uri: str) -> bool:
+    def authenticate(self, code: str, redirect_uri: str, state: Optional[str] = None) -> bool:
         if Flow is None or build is None:
             return False
         try:
-            flow_file = DATA_DIR / 'gdrive_flow.json'
+            flow_file = FLOW_FILE
             if not flow_file.exists():
                 return False
             with open(flow_file, 'r') as f:
                 flow_data = json.load(f)
+            stored_state = flow_data.get('state')
+            if stored_state and state and state != stored_state:
+                logger.error("State OAuth no coincide")
+                return False
             
             flow = Flow.from_client_config(
                 flow_data['client_config'],
@@ -137,8 +217,9 @@ class GoogleDriveService:
             self.creds = creds
             self.service = build('drive', 'v3', credentials=creds)
             try:
-                flow_file.unlink()
-            except:
+                if flow_file.exists():
+                    flow_file.unlink()
+            except Exception:
                 pass
             return True
         except Exception as e:

@@ -36,9 +36,10 @@ export function FolderPickerModal(props: {
   open: boolean;
   onClose: () => void;
   onConfirm: (paths: string[]) => void;
+  onOpenDriveSettings?: () => void;
   title?: string;
 }) {
-  const { open, onClose, onConfirm, title } = props;
+  const { open, onClose, onConfirm, onOpenDriveSettings, title } = props;
   const { t } = useI18n();
   const [source, setSource] = useState<Source>('local');
   const [currentPath, setCurrentPath] = useState<string | null>(null);
@@ -138,7 +139,14 @@ export function FolderPickerModal(props: {
     setSource(next);
     if (next === 'drive') {
       setDriveStack([{ id: 'root', name: 'Google Drive' }]);
-      void loadDrive('root');
+      setError(null);
+      // Without a connected account the listing would just 401: show the
+      // "connect first" notice instead of an error.
+      if (driveReady) {
+        void loadDrive('root');
+      } else {
+        setEntries([]);
+      }
     } else {
       void load(null);
     }
@@ -207,14 +215,14 @@ export function FolderPickerModal(props: {
             <button
               type="button"
               onClick={() => switchSource('drive')}
-              disabled={!driveReady}
               className={`px-3 py-1.5 text-xs flex items-center gap-1.5 border-l border-white/10 transition ${
                 source === 'drive' ? 'bg-white/10 text-white' : 'text-slate-400 hover:text-white'
-              } ${driveReady ? '' : 'opacity-40 cursor-not-allowed'}`}
+              }`}
               title={driveReady ? 'Google Drive' : t('drive_not_connected')}
             >
               <Cloud size={13} />
               Google Drive
+              {!driveReady && <span className="w-1.5 h-1.5 rounded-full bg-amber-400" aria-hidden />}
             </button>
           </div>
           <Button
@@ -243,7 +251,18 @@ export function FolderPickerModal(props: {
         </div>
 
         <div className="max-h-[55vh] overflow-y-auto px-2 pb-2">
-          {loading ? (
+          {source === 'drive' && !driveReady ? (
+            <div className="px-4 py-10 text-center text-sm">
+              <Cloud className="mx-auto mb-3 text-slate-500" size={28} />
+              <p className="text-slate-300 mb-1">{t('drive_not_connected')}</p>
+              <p className="text-slate-500 mb-4">{t('drive_connect_hint')}</p>
+              {onOpenDriveSettings && (
+                <Button type="button" size="sm" variant="secondary" onClick={onOpenDriveSettings}>
+                  {t('gdrive_open_settings')}
+                </Button>
+              )}
+            </div>
+          ) : loading ? (
             <div className="flex items-center justify-center py-16 text-slate-300">
               <Loader2 className="animate-spin mr-3" size={18} />
               {t('loading')}
@@ -254,7 +273,7 @@ export function FolderPickerModal(props: {
             </div>
           ) : entries.length === 0 ? (
             <div className="px-4 py-10 text-center text-sm text-slate-400">
-              {source === 'drive' && !driveReady ? t('drive_not_connected') : t('no_subfolders')}
+              {t('no_subfolders')}
             </div>
           ) : (
             <div className="space-y-1">

@@ -1317,15 +1317,40 @@ export const MediaService = {
     }
   },
 
-  async getGDriveAuthUrl(): Promise<{ auth_url: string }> {
+  async getGDriveAuthUrl(): Promise<{ auth_url: string; redirect_uri?: string; client_type?: string | null }> {
     const res = await fetchWithFallback(`${API_BASE}/gdrive/auth/url`, { headers: adminHeadersAny() });
     if (!res.ok) throw new Error('Failed to get auth url');
     return res.json();
   },
 
-  async getGDriveStatus(): Promise<{ authenticated: boolean }> {
+  async getGDriveStatus(): Promise<{ authenticated: boolean; credentials_present?: boolean; client_type?: string | null }> {
     const res = await fetchWithFallback(`${API_BASE}/gdrive/status`, { headers: adminHeadersAny() });
     if (!res.ok) throw new Error('Failed to get status');
+    return res.json();
+  },
+
+  /** Store the OAuth client JSON downloaded from Google Cloud Console.
+   * The server keeps it in its own data dir; it is never sent back. */
+  async uploadGDriveCredentials(clientJson: unknown): Promise<{ ok: boolean; client_type?: string | null }> {
+    const res = await fetchWithFallback(`${API_BASE}/gdrive/credentials`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(adminHeadersAny() || {}) },
+      body: JSON.stringify(clientJson),
+    });
+    if (!res.ok) {
+      let detail = '';
+      try { detail = (await res.json())?.detail || ''; } catch { /* ignore */ }
+      throw new Error(detail || 'Failed to save credentials');
+    }
+    return res.json();
+  },
+
+  async disconnectGDrive(): Promise<{ ok: boolean; authenticated: boolean; credentials_present?: boolean; client_type?: string | null }> {
+    const res = await fetchWithFallback(`${API_BASE}/gdrive/disconnect`, {
+      method: 'POST',
+      headers: adminHeadersAny(),
+    });
+    if (!res.ok) throw new Error('Failed to disconnect');
     return res.json();
   },
 

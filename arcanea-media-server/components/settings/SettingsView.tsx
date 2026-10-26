@@ -9,6 +9,7 @@ import { Drive, ScanStatus, MetadataConfig, UserProfile, TelemetryEvent, Telemet
 import { useI18n } from '../../i18n/i18n';
 import { MediaService } from '../../services/api';
 import { FolderPickerModal } from './FolderPickerModal';
+import { GDriveSection } from './GDriveSection';
 import { HelpModal } from './HelpModal';
 import { NoMatchModal } from './NoMatchModal';
 import { SystemStatusDashboard } from './sections/SystemStatusDashboard';
@@ -829,7 +830,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <div className="rounded-3xl border border-white/10 bg-gradient-to-br from-[#0b1220] via-[#0f172a] to-[#0b1220] p-6 shadow-[0_20px_60px_-45px_rgba(15,23,42,0.9)]">
                 <h2 className="text-xl font-semibold flex items-center mb-6 text-white"><FolderPlusIcon className="mr-3 text-cyan-400" /> {t('library_folders')}</h2>
                 <form onSubmit={handleAddPath} className="flex flex-wrap gap-3 mb-6"><input type="text" value={newPathInput} onChange={e => setNewPathInput(e.target.value)} placeholder={t('library_path_placeholder')} className="flex-1 min-w-[220px] bg-black/40 border border-white/10 rounded-xl px-4 py-2.5 text-sm text-white focus:ring-2 focus:ring-cyan-500 outline-none" /><Button type="button" variant="ghost" onClick={() => setShowFolderPicker(true)} icon={<FolderPlus size={16} />}>{t('browse')}</Button><Button type="submit" disabled={!newPathInput.trim()} icon={<Plus size={16} />}>{t('add')}</Button></form>
-                <FolderPickerModal open={showFolderPicker} onClose={() => setShowFolderPicker(false)} onConfirm={paths => { for (const p of paths || []) onAddPath(p, newPathType); setShowFolderPicker(false); }} />
+                <FolderPickerModal open={showFolderPicker} onClose={() => setShowFolderPicker(false)} onOpenDriveSettings={() => { setShowFolderPicker(false); setTimeout(() => document.getElementById('gdrive-section')?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 80); }} onConfirm={paths => { for (const p of paths || []) onAddPath(p, newPathType); setShowFolderPicker(false); }} />
                 <div className="space-y-2">
                   {libraryPaths.map((p) => (
                     <div key={p} className="flex items-center justify-between p-4 bg-white/5 rounded-2xl border border-white/10 group hover:border-cyan-400/40 hover:bg-white/10 transition-all">
@@ -839,6 +840,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   ))}
                 </div>
               </div>
+
+              <GDriveSection />
             </div>
 
             {/* Right Column: Scan & Metadata Dashboard */}

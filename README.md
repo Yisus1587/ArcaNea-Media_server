@@ -100,6 +100,7 @@ cd arcanea-media-server && npm run dev
 | `ARCANEA_API_PORT`, `ARCANEA_DEV_PORT` | Puerto de la API y de Vite en dev |
 | `ARCANEA_DATA_DIR`, `ARCANEA_DB_URL`, `ARCANEA_CACHE_DIR` | Ubicación de datos y SQLite |
 | `TMDB_API_KEY` / `TMDB_ACCESS_TOKEN` / `TMDB_USE_V4` | Credenciales TMDB (también se guardan desde Ajustes → Credenciales) |
+| `ARCANEA_GDRIVE_CLIENT_ID` / `ARCANEA_GDRIVE_CLIENT_SECRET` | Cliente OAuth propio de Google Drive (opcional; por defecto se sube desde Ajustes) |
 
 El listado completo vive en `src/core/config.py`.
 
@@ -111,6 +112,55 @@ El listado completo vive en `src/core/config.py`.
 4. Usa "Revisar sin match" o "Corregir Match (Manual)" si hay errores.
 5. Reproduce contenido desde la UI.
 
+## Google Drive
+
+ArcaNea puede usar carpetas de Google Drive como raíces de biblioteca
+(`gdrive://<id>`). **No se incluye ningún client ID ni secret en el
+proyecto**: cada instalación usa su propio proyecto de Google, tal como
+exigen las políticas de Google para una aplicación distribuida.
+
+### Configuración (una sola vez por servidor)
+
+1. Abre la [consola de Google Cloud](https://console.cloud.google.com/apis/credentials)
+   y crea un proyecto nuevo.
+2. **API y servicios → Biblioteca**: habilita **Google Drive API**.
+3. **Pantalla de consentimiento de OAuth**: tipo *Externo*, añade tu cuenta
+   como usuario de prueba.
+4. **Credenciales → Crear credenciales → ID de cliente de OAuth**: elige
+   **Aplicación de escritorio** y descarga el JSON.
+5. En ArcaNea: **Ajustes → Google Drive** → pega o sube el JSON →
+   **Guardar JSON** → **Conectar con Google**. El servidor guarda el JSON
+   en su directorio de datos (`gdrive_credentials.json`, permisos 0600) y
+   el token en `gdrive_token.json`; ninguno de los dos se devuelve por la
+   API ni se registra en logs.
+
+El login se completa **una sola vez en el navegador del ordenador donde
+corre el servidor**: el token queda guardado allí y todos los clientes
+(la app Android incluida) reutilizan esa conexión sin repetir el login.
+
+### URI de redirección
+
+La `redirect_uri` que se envía a Google depende del tipo de cliente y del
+host desde el que navega el usuario (la calcula el backend y la muestra la
+UI):
+
+| Tipo de cliente | redirect_uri | Nota |
+|---|---|---|
+| `installed` (escritorio) | `http://<host>:<puerto>/api/gdrive/auth/callback` | Acepta `127.0.0.1` o la IP de la LAN con puerto |
+| `web` | `http://localhost:<puerto>/api/gdrive/auth/callback` | Google rechaza las IP en clientes web; hay que registrarla a mano en la consola |
+
+El puerto es el del servidor ArcaNea (9800 por defecto).
+
+### Cliente OAuth por variables de entorno
+
+Para quien quiera distribuir su propia build con un cliente ya configurado:
+
+| Variable | Descripción |
+|---|---|
+| `ARCANEA_GDRIVE_CLIENT_ID` | `client_id` del cliente OAuth |
+| `ARCANEA_GDRIVE_CLIENT_SECRET` | `client_secret` del cliente OAuth |
+
+Tienen prioridad sobre `gdrive_credentials.json`.
 ## Seguridad
 
 - Los endpoints de administración (scan, enrich, fs, logs, credenciales,

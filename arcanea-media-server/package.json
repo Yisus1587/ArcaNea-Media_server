@@ -11,6 +11,8 @@
   "dependencies": {
     "@capacitor-mlkit/barcode-scanning": "^8.2.1",
     "@capacitor/android": "^8.5.3",
+    "@capacitor/app": "^8.1.2",
+    "@capacitor/browser": "^8.0.5",
     "@capacitor/core": "^8.5.3",
     "@capacitor/preferences": "^8.0.1",
     "lucide-react": "^0.563.0",
